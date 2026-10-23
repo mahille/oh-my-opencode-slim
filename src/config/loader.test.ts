@@ -69,6 +69,24 @@ describe('loadPluginConfig', () => {
     return filename;
   }
 
+  test('presetOverride selects before merges despite another disk or env selection', () => {
+    const projectDir = path.join(tempDir, 'project');
+    writeProjectConfig(projectDir, {
+      preset: 'alternate',
+      presets: {
+        original: { explorer: { model: 'original/primary' } },
+        alternate: {
+          explorer: { model: 'alternate/primary', temperature: 0.9 },
+        },
+      },
+    });
+    process.env.OH_MY_OPENCODE_SLIM_PRESET = 'alternate';
+    const config = loadPluginConfig(projectDir, { presetOverride: 'original' });
+    expect(config.preset).toBe('original');
+    expect(config.agents?.explorer?.model).toBe('original/primary');
+    expect(config.agents?.explorer?.temperature).toBeUndefined();
+  });
+
   test('inherits custom agents when loading from a nested Git worktree', () => {
     const workspace = path.join(tempDir, 'workspace');
     const repo = path.join(workspace, 'repo');

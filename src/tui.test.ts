@@ -32,6 +32,7 @@ import {
   STATUS_STOPPED_GLYPH,
   selectionGuard,
   shortSessionID,
+  sidebarAgentProjection,
   sidebarSiblingAnnotation,
   splitSidebarModelId,
   default as tuiPlugin,
@@ -43,6 +44,8 @@ import {
   killAllSummaryMessage,
 } from './tui-kill';
 import {
+  getTuiAttachDir,
+  readTuiAttachMarker,
   recordTuiAgentActivity,
   recordTuiAgentModels,
   recordTuiSessionParent,
@@ -204,6 +207,7 @@ function createSnapshot(overrides: Partial<TuiSnapshot> = {}): TuiSnapshot {
     sessionDetails: {},
     reusableByAgent: {},
     reusableOwners: {},
+    sessionAgentModels: {},
     ...overrides,
   };
 }
@@ -295,6 +299,77 @@ describe('tui sidebar agents', () => {
     expect(merged.agentModels).toEqual({
       explorer: 'local/model',
       fixer: 'openai/gpt-6',
+    });
+  });
+
+  test('visible conversation projection wins over global rows; global rows used without a record', () => {
+    const snapshot = createSnapshot({
+      agentModels: { explorer: 'openai/gpt-6-global' },
+      agentVariants: { explorer: 'low' },
+      sessionParents: { 'child-a': 'root-a' },
+      sessionAgentModels: {
+        'root-a': {
+          agentModels: { explorer: 'openai/gpt-6-session' },
+          agentVariants: { explorer: 'high' },
+          updatedAt: 1,
+        },
+      },
+    });
+
+    // The visible conversation's recorded snapshot wins per agent...
+    expect(sidebarAgentProjection(snapshot, 'root-a')).toEqual({
+      agentModels: { explorer: 'openai/gpt-6-session' },
+      agentVariants: { explorer: 'high' },
+    });
+    // ...and a child route resolves to its conversation root's record.
+    expect(
+      sidebarAgentProjection(snapshot, 'child-a').agentModels.explorer,
+    ).toBe('openai/gpt-6-session');
+
+    // No record for the viewed conversation: the global rows apply.
+    expect(sidebarAgentProjection(snapshot, 'other-root')).toEqual({
+      agentModels: { explorer: 'openai/gpt-6-global' },
+      agentVariants: { explorer: 'low' },
+    });
+    // Home route (no visible session): the global projection unchanged.
+    expect(sidebarAgentProjection(snapshot)).toEqual({
+      agentModels: { explorer: 'openai/gpt-6-global' },
+      agentVariants: { explorer: 'low' },
+    });
+
+    // A pinned record is authoritative: global rows and variants cannot leak in.
+    const mixed = createSnapshot({
+      agentModels: {
+        explorer: 'openai/gpt-6-global',
+        fixer: 'openai/gpt-6-fixer',
+      },
+      agentVariants: { explorer: 'high' },
+      sessionAgentModels: {
+        'root-c': {
+          agentModels: { explorer: 'openai/gpt-6-session' },
+          agentVariants: {},
+          updatedAt: 1,
+        },
+      },
+    });
+    expect(sidebarAgentProjection(mixed, 'root-c').agentModels).toEqual({
+      explorer: 'openai/gpt-6-session',
+    });
+    expect(sidebarAgentProjection(mixed, 'root-c').agentVariants).toEqual({});
+    expect(getSidebarAgentNames(mixed, 'root-c')).toEqual(['explorer']);
+    expect(getSidebarAgentNames(createSnapshot({}), 'root-c')).toEqual(
+      expect.arrayContaining(['explorer', 'fixer']),
+    );
+
+    // v1 hosts never write records: a legacy snapshot without the section
+    // is a no-op (falls back to the global rows).
+    const { sessionAgentModels: _unused, ...legacy } = createSnapshot({
+      agentModels: { explorer: 'openai/gpt-6-global' },
+    });
+    expect(
+      sidebarAgentProjection(legacy as TuiSnapshot, 'root-a').agentModels,
+    ).toEqual({
+      explorer: 'openai/gpt-6-global',
     });
   });
 
@@ -1521,6 +1596,71 @@ describe('clickable sidebar sessions', () => {
       renderSidebar(snapshot, 'test', attributionTheme, false, false, () => 0),
     );
     expect(frame).toContain('explorer');
+  });
+
+  test('sidebar frame shows the visible conversation projection over global rows', async () => {
+    const base = { agentModels: { explorer: 'openai/gpt-6-global' } };
+    const withRecord = createSnapshot({
+      ...base,
+      sessionAgentModels: {
+        'conv-1': {
+          agentModels: { explorer: 'openai/gpt-6-session' },
+          agentVariants: {},
+          updatedAt: 1,
+        },
+      },
+    });
+
+    // The viewed conversation has a recorded snapshot: its rows win.
+    const recorded = await renderAttributionFrame(() =>
+      renderSidebar(
+        withRecord,
+        'test',
+        attributionTheme,
+        false,
+        false,
+        () => 0,
+        'conv-1',
+        expandedInteraction(),
+      ),
+    );
+    expect(recorded).toContain('gpt-6-session');
+    expect(recorded).not.toContain('gpt-6-global');
+
+    // A child of the same conversation resolves to the same record.
+    const childFrame = await renderAttributionFrame(() =>
+      renderSidebar(
+        createSnapshot({
+          ...base,
+          sessionParents: { 'child-a': 'conv-1' },
+          sessionAgentModels: withRecord.sessionAgentModels,
+        }),
+        'test',
+        attributionTheme,
+        false,
+        false,
+        () => 0,
+        'child-a',
+        expandedInteraction(),
+      ),
+    );
+    expect(childFrame).toContain('gpt-6-session');
+
+    // No record for the viewed conversation: the global rows apply.
+    const globalFrame = await renderAttributionFrame(() =>
+      renderSidebar(
+        createSnapshot(base),
+        'test',
+        attributionTheme,
+        false,
+        false,
+        () => 0,
+        'conv-1',
+        expandedInteraction(),
+      ),
+    );
+    expect(globalFrame).toContain('gpt-6-global');
+    expect(globalFrame).not.toContain('gpt-6-session');
   });
 
   test('alias ordering is numeric (ora-2 before ora-10), unaliased last', () => {
@@ -2856,6 +2996,66 @@ describe('clickable sidebar sessions', () => {
     }
   });
 
+  for (const sessionModelState of [false, undefined, true]) {
+    test(`v2 sidebar gates persisted conversation rows (${sessionModelState})`, async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'omos-model-state-'));
+      const projectDir = path.join(root, 'project');
+      fs.mkdirSync(path.join(projectDir, '.opencode'), { recursive: true });
+      fs.writeFileSync(
+        path.join(projectDir, '.opencode', 'oh-my-opencode-slim.json'),
+        JSON.stringify({
+          sessionModelState,
+          preset: 'global',
+          compactSidebar: false,
+        }),
+      );
+      const restoreDataHome = withIsolatedDataHome(root);
+      let setup: Awaited<ReturnType<typeof testRender>> | undefined;
+      let mounted:
+        | Awaited<ReturnType<typeof mountClickableSidebar>>
+        | undefined;
+      try {
+        updateSnapshot(projectDir, (snapshot) => {
+          snapshot.agentModels = { explorer: 'openai/global-model' };
+          snapshot.agentVariants = { explorer: 'global-variant' };
+          snapshot.sessionAgentModels['conv-1'] = {
+            agentModels: { explorer: 'openai/pinned-model' },
+            agentVariants: { explorer: 'pinned-variant' },
+            preset: 'pinned',
+          };
+        });
+        mounted = await mountClickableSidebar({
+          host: 'v2',
+          projectDir,
+          sessionID: 'conv-1',
+          navigate: () => {},
+        });
+        setup = await testRender(
+          () => mounted?.slotPlugin?.slots.sidebar_content() as never,
+          { width: 70, height: 18 },
+        );
+        await setup.renderOnce();
+        const frame = setup.captureCharFrame();
+        const expected = sessionModelState ? 'pinned' : 'global';
+        const ignored = sessionModelState ? 'global' : 'pinned';
+        expect(frame).toContain(`${expected}-model`);
+        expect(frame).toContain(`${expected}-variant`);
+        expect(frame).not.toContain(`${ignored}-model`);
+        expect(frame).not.toContain(`${ignored}-variant`);
+        expect(frame).toContain(`Preset ${expected}`);
+        expect(frame).not.toContain(`Preset ${ignored}`);
+        expect(fs.existsSync(getTuiAttachDir(projectDir))).toBe(
+          sessionModelState === true,
+        );
+      } finally {
+        setup?.renderer.destroy();
+        for (const dispose of mounted?.disposers ?? []) dispose();
+        restoreDataHome();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+
   test('sidebar frame text and colors remain byte-identical (v2)', async () => {
     const { version } = (await Bun.file(
       new URL('../package.json', import.meta.url),
@@ -3799,4 +3999,98 @@ describe('sidebar model display names', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+});
+
+describe('TUI attach markers (sidebar runtime)', () => {
+  test('records a marker when the visible session changes, not on unchanged repeats', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'omos-attach-marker-'));
+    const projectDir = path.join(root, 'project');
+    fs.mkdirSync(projectDir, { recursive: true });
+    const oldDataHome = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = path.join(root, 'data');
+    const prevRefreshMs = process.env.OH_MY_OPENCODE_SLIM_TUI_REFRESH_MS;
+    const disposers: Array<() => void> = [];
+    // The route is re-read by the runtime on every poll; the getter lets
+    // the test simulate navigation without a rendered click.
+    let visibleSession = 'ses_boot';
+    try {
+      process.env.OH_MY_OPENCODE_SLIM_TUI_REFRESH_MS = '25';
+      await tuiPlugin.tui(
+        {
+          state: { path: { directory: projectDir } },
+          route: {
+            get current() {
+              return { name: 'session', params: { sessionID: visibleSession } };
+            },
+            navigate: () => {},
+          },
+          lifecycle: {
+            onDispose: (callback: () => void) => {
+              disposers.push(callback);
+              return () => {};
+            },
+          },
+          renderer: { requestRender: () => {} },
+          slots: { register: () => 'test-slot' },
+          theme: {
+            current: {
+              accent: '#22c55e',
+              background: '#111111',
+              borderActive: '#555555',
+              text: '#ffffff',
+              textMuted: '#aaaaaa',
+            },
+          },
+        } as Parameters<typeof tuiPlugin.tui>[0],
+        {},
+        { version: 'test' } as Parameters<typeof tuiPlugin.tui>[2],
+      );
+
+      const marker = (sessionID: string) =>
+        readTuiAttachMarker(
+          path.join(getTuiAttachDir(projectDir), `${sessionID}.json`),
+        );
+      const waitForMarker = async (predicate: () => boolean): Promise<void> => {
+        const deadline = Date.now() + 5000;
+        while (!predicate()) {
+          if (Date.now() > deadline) throw new Error('waitForMarker timed out');
+          await Bun.sleep(10);
+        }
+      };
+
+      // Boot: the route was already resolved when the runtime was
+      // constructed (TUI started attached to a session) — the marker
+      // exists immediately after setup.
+      expect(marker('ses_boot')?.sessionID).toBe('ses_boot');
+      expect(marker('ses_boot')?.tuiBootID).toBeTypeOf('string');
+      const bootTimestamp = marker('ses_boot')?.timestamp ?? 0;
+
+      // Navigation to another conversation: the next poll records it.
+      visibleSession = 'ses_nav';
+      await waitForMarker(() => marker('ses_nav') !== null);
+      expect(marker('ses_nav')?.sessionID).toBe('ses_nav');
+      const navTimestamp = marker('ses_nav')?.timestamp ?? 0;
+
+      // Unchanged visible session: no rewrite across several polls.
+      await Bun.sleep(80);
+      expect(marker('ses_nav')?.timestamp).toBe(navTimestamp);
+
+      // Navigating back rewrites the marker with a newer timestamp.
+      visibleSession = 'ses_boot';
+      await waitForMarker(
+        () => (marker('ses_boot')?.timestamp ?? 0) > bootTimestamp,
+      );
+      expect(marker('ses_boot')?.sessionID).toBe('ses_boot');
+    } finally {
+      for (const dispose of disposers) dispose();
+      if (prevRefreshMs === undefined) {
+        delete process.env.OH_MY_OPENCODE_SLIM_TUI_REFRESH_MS;
+      } else {
+        process.env.OH_MY_OPENCODE_SLIM_TUI_REFRESH_MS = prevRefreshMs;
+      }
+      if (oldDataHome === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = oldDataHome;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 10_000);
 });

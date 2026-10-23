@@ -814,8 +814,18 @@ export class ForegroundFallbackManager {
    *  in-flight fallback sequence finishes against its own generation even if
    *  a hot refresh publishes a new chain table mid-descent. First call wins;
    *  chain resolution pins lazily as a safety net. */
-  pinSessionChains(sessionID: string): void {
-    this.pinnedChains(sessionID);
+  pinSessionChains(
+    sessionID: string,
+    chains?: Record<string, ReadonlyArray<ForegroundFallbackModel>>,
+    replace = true,
+  ): void {
+    if (chains && (replace || !this.sessionChains.has(sessionID))) {
+      // Explicit capture precedes admission and is authoritative even if an
+      // early registration event already lazily pinned the global defaults.
+      this.sessionChains.set(sessionID, { ...chains });
+    } else {
+      this.pinnedChains(sessionID);
+    }
   }
 
   /** Release a session's pinned generation so a retry after a failed

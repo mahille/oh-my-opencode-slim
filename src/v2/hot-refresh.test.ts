@@ -5,8 +5,9 @@
  * frozen for a session's lifetime).
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { readTuiSnapshot } from '../tui-state';
+import { getTuiAttachDir, readTuiSnapshot } from '../tui-state';
 import { createV2Setup } from './setup';
 import { makeTestEnv, type TestEnv } from './test-fixtures';
 import type { V2Context, V2SessionContextEvent } from './types';
@@ -47,6 +48,9 @@ afterEach(() => {
   env.restore();
 });
 
+// Legacy watcher integration checks below exercise real fs.watch delivery,
+// which cannot be advanced with an injected scheduler. Prompt-path regressions
+// use awaited admission directly and never wait for watcher/debounce timing.
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function waitFor(
@@ -72,6 +76,7 @@ interface Harness {
   agentTransformCalls: () => number;
   agentReloadCalls: () => number;
   flushAgentTransform: () => void;
+  parents: Map<string, string>;
 }
 
 /** Live sidebar model projection for the fixture project dir. */
@@ -131,6 +136,7 @@ async function bootHarness(deferAgentTransform = false): Promise<Harness> {
   const promptHandlers: Array<
     (event: Record<string, unknown>) => Promise<void>
   > = [];
+  const parents = new Map<string, string>();
 
   const ctx = {
     app: { name: 'opencode', version: 'v2-hot-refresh-test' },
@@ -190,7 +196,15 @@ async function bootHarness(deferAgentTransform = false): Promise<Harness> {
       // a parentID + plugin agent; root/foreign sessions are recognizable.
       get: async ({ sessionID }: { sessionID: string }) => ({
         id: sessionID,
-        ...(sessionID.startsWith('root') ? {} : { parentID: 'parent-1' }),
+        ...(sessionID.startsWith('root') ||
+        sessionID === 'parent-1' ||
+        sessionID === 'other-root'
+          ? {}
+          : {
+              parentID:
+                parents.get(sessionID) ??
+                (sessionID === 'unprompted-child' ? 'other-root' : 'parent-1'),
+            }),
         agent: sessionID.startsWith('foreign') ? 'build' : 'explorer',
         ...(sessionID === 'per-call-child' && {
           model: { providerID: 'other', id: 'per-call', variant: 'low' },
@@ -235,6 +249,7 @@ async function bootHarness(deferAgentTransform = false): Promise<Harness> {
       }
     },
     switchCalls,
+    parents,
     get contextHandler() {
       return contextHandler;
     },
@@ -271,6 +286,28 @@ function createChildEvent(sessionID: string): Record<string, unknown> {
   };
 }
 
+/** Immutable TUI operation, consumed synchronously at prompt admission. */
+function writeOperation(
+  sessionID: string,
+  preset: string,
+  kind: 'initialize' | 'switch',
+  revision: string,
+) {
+  const attachDir = getTuiAttachDir(env.projectDir);
+  fs.mkdirSync(attachDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(attachDir, `${sessionID}.json`),
+    JSON.stringify({
+      sessionID,
+      tuiBootID: `tui-${sessionID}`,
+      timestamp: 1,
+      revision,
+      kind,
+      config: { sessionModelState: true, ...hot(preset) },
+    }),
+  );
+}
+
 /** Push probe children until one captures a seeded profile. */
 async function captureFirstChild(
   harness: Harness,
@@ -288,6 +325,207 @@ async function captureFirstChild(
 }
 
 describe('v2 session-frozen hot refresh', () => {
+  test('invalid shared config retains last-good dispatch on admission and after repair', async () => {
+    env.writeUserConfig({ sessionModelState: true, ...hot('cheap') });
+    await withHarness(async (harness) => {
+      const prompt = (sessionID: string) =>
+        harness.invokePrompt({ sessionID, prompt: { text: 'test' } });
+      await prompt('parent-1');
+      fs.writeFileSync(env.userConfigPath, '{ invalid json');
+      // An unbound root must pin last-good defaults, not wait for another TUI's write.
+      await prompt('root-invalid');
+      harness.parents.set('invalid-child', 'root-invalid');
+      await prompt('invalid-child');
+      env.writeUserConfig({ sessionModelState: true, ...hot('strong') });
+      await prompt('root-invalid');
+      await prompt('parent-1');
+      harness.parents.set('repaired-child', 'root-invalid');
+      await prompt('repaired-child');
+      await prompt('existing-root-child');
+      expect(harness.switchCalls.map(({ model }) => model.id)).toEqual([
+        'gpt-5-mini',
+        'gpt-5-mini',
+        'gpt-5-mini',
+      ]);
+      expect(
+        readTuiSnapshot(env.projectDir).sessionAgentModels['parent-1']
+          ?.agentModels.explorer,
+      ).toBe('openai/gpt-5-mini');
+    });
+  });
+
+  test('two initialized conversations remain isolated across disk writes, navigation and targeted Apply', async () => {
+    env.writeUserConfig({ sessionModelState: true, ...hot('cheap') });
+    await withHarness(async (harness) => {
+      const prompt = (sessionID: string) =>
+        harness.invokePrompt({
+          sessionID,
+          messageID: `msg_${sessionID}`,
+          prompt: { text: 'test' },
+        });
+      writeOperation('root-a', 'cheap', 'initialize', 'a-init');
+      writeOperation('root-b', 'cheap', 'initialize', 'b-init');
+      await prompt('root-a');
+      await prompt('root-b');
+      harness.parents.set('old-a', 'root-a');
+      await prompt('old-a');
+      env.writeUserConfig({ sessionModelState: true, ...hot('strong') });
+      // Navigation must not rebind B from the new shared selection.
+      writeOperation('root-b', 'strong', 'initialize', 'b-navigation');
+      await prompt('root-b');
+      harness.parents.set('new-b', 'root-b');
+      await prompt('new-b');
+      // No sleep: admission must consume Apply before the watcher debounce.
+      writeOperation('root-a', 'strong', 'switch', 'a-apply');
+      harness.parents.set('new-a', 'root-a');
+      await prompt('new-a');
+      harness.parents.set('per-call-child', 'root-a');
+      await prompt('per-call-child');
+      harness.parents.set('grandchild', 'old-a');
+      await prompt('grandchild');
+      harness.parents.set('great-grandchild', 'grandchild');
+      await prompt('great-grandchild');
+      await prompt('old-a');
+      expect(
+        harness.switchCalls.map(({ sessionID, model }) => [
+          sessionID,
+          model.id,
+        ]),
+      ).toEqual([
+        ['old-a', 'gpt-5-mini'],
+        ['new-b', 'gpt-5-mini'],
+        ['new-a', 'claude-sonnet-4-5'],
+        ['grandchild', 'gpt-5-mini'],
+        ['great-grandchild', 'gpt-5-mini'],
+      ]);
+      const records = readTuiSnapshot(env.projectDir).sessionAgentModels;
+      expect(records['root-a']?.agentModels.explorer).toBe(
+        'anthropic/claude-sonnet-4-5',
+      );
+      expect(records['root-b']?.agentModels.explorer).toBe('openai/gpt-5-mini');
+      await waitFor(
+        () => sidebarModels().explorer === 'anthropic/claude-sonnet-4-5',
+      );
+      // A root first admitted after the edit binds the new defaults; B stays cheap.
+      await prompt('root-c');
+      harness.parents.set('new-c', 'root-c');
+      await prompt('new-c');
+      expect(
+        harness.switchCalls.find((call) => call.sessionID === 'new-c')?.model
+          .id,
+      ).toBe('claude-sonnet-4-5');
+      expect(
+        readTuiSnapshot(env.projectDir).sessionAgentModels['root-c']
+          ?.agentModels.explorer,
+      ).toBe('anthropic/claude-sonnet-4-5');
+      expect(harness.agentTransformCalls()).toBe(1);
+      expect(harness.agentReloadCalls()).toBe(0);
+    });
+  });
+
+  test('root prompts retain their projection while global defaults refresh', async () => {
+    env.writeUserConfig({ sessionModelState: true, ...hot('cheap') });
+    await withHarness(async (harness) => {
+      const prompt = (sessionID: string) =>
+        harness.invokePrompt({
+          sessionID,
+          messageID: `msg_${sessionID}`,
+          prompt: { text: 'test' },
+        });
+
+      // The startup seed writes the global projection (cheap preset).
+      await waitFor(() => sidebarModels().explorer === 'openai/gpt-5-mini');
+
+      // A root prompt resolves its conversation snapshot from disk and
+      // records the per-session projection for the sidebar.
+      await prompt('parent-1');
+      let sessionRecord = readTuiSnapshot(env.projectDir).sessionAgentModels[
+        'parent-1'
+      ];
+      expect(sessionRecord?.agentModels.explorer).toBe('openai/gpt-5-mini');
+      expect(sessionRecord?.updatedAt).toBeTypeOf('number');
+
+      // Shared disk changes cannot mutate an already bound conversation.
+      env.writeUserConfig({ sessionModelState: true, ...hot('strong') });
+      await prompt('parent-1');
+      sessionRecord = readTuiSnapshot(env.projectDir).sessionAgentModels[
+        'parent-1'
+      ];
+      expect(sessionRecord?.agentModels.explorer).toBe('openai/gpt-5-mini');
+      writeOperation('parent-1', 'strong', 'switch', 'apply-strong');
+      await prompt('parent-1');
+      sessionRecord = readTuiSnapshot(env.projectDir).sessionAgentModels[
+        'parent-1'
+      ];
+      expect(sessionRecord?.agentModels.explorer).toBe(
+        'anthropic/claude-sonnet-4-5',
+      );
+      await waitFor(
+        () => sidebarModels().explorer === 'anthropic/claude-sonnet-4-5',
+      );
+    });
+  }, 20_000);
+
+  test('TUI initialize binds its captured config rather than shared disk before the first prompt', async () => {
+    env.writeUserConfig({ sessionModelState: true, ...hot('cheap') });
+    await withHarness(async (harness) => {
+      // The startup seed writes the global projection (cheap preset).
+      await waitFor(() => sidebarModels().explorer === 'openai/gpt-5-mini');
+
+      // Shared disk changes do not replace the immutable operation below.
+      env.writeUserConfig({ sessionModelState: true, ...hot('strong') });
+
+      writeOperation('parent-1', 'cheap', 'initialize', 'captured-cheap');
+      await harness.invokePrompt({
+        sessionID: 'parent-1',
+        prompt: { text: 'start' },
+      });
+      expect(
+        readTuiSnapshot(env.projectDir).sessionAgentModels['parent-1']
+          ?.agentModels.explorer,
+      ).toBe('openai/gpt-5-mini');
+
+      // Global defaults still refresh independently of the captured operation.
+      await waitFor(
+        () => sidebarModels().explorer === 'anthropic/claude-sonnet-4-5',
+      );
+
+      // A new child inherits the immutable operation, not the shared disk.
+      await harness.invokePrompt({
+        sessionID: 'attach-child',
+        prompt: { text: 'start' },
+      });
+      expect(
+        harness.switchCalls.find((call) => call.sessionID === 'attach-child')
+          ?.model.id,
+      ).toBe('gpt-5-mini');
+    });
+  }, 20_000);
+
+  test('the attach watcher binds captured config without a prompt', async () => {
+    env.writeUserConfig({ sessionModelState: true, ...hot('cheap') });
+    await withHarness(async (harness) => {
+      writeOperation('parent-1', 'strong', 'initialize', 'watcher-init');
+      // This deliberately exercises real fs.watch, not prompt-path consumption.
+      await waitFor(
+        () =>
+          readTuiSnapshot(env.projectDir).sessionAgentModels['parent-1']
+            ?.agentModels.explorer === 'anthropic/claude-sonnet-4-5',
+      );
+      expect(sidebarModels().explorer).toBe('openai/gpt-5-mini');
+      await harness.invokePrompt({
+        sessionID: 'watcher-child',
+        prompt: { text: 'inherit attach snapshot' },
+      });
+      expect(harness.switchCalls).toEqual([
+        {
+          sessionID: 'watcher-child',
+          model: { providerID: 'anthropic', id: 'claude-sonnet-4-5' },
+        },
+      ]);
+    });
+  });
+
   test('session profile bridge sees plugin agents after deferred agent transform', async () => {
     env.writeUserConfig(hot('cheap'));
     const harness = await bootHarness(true);
@@ -360,6 +598,8 @@ describe('v2 session-frozen hot refresh', () => {
         harness.switchCalls.filter((call) => call.sessionID === firstChild),
       ).toHaveLength(switchCountBefore);
 
+      // Explicit Apply updates this root's future children, not global edits.
+      writeOperation('parent-1', 'strong', 'switch', 'apply-strong');
       // ...while a NEW child gets the fresh profile/options.
       const secondChild = await captureFirstChild(harness, 'second');
       const secondSwitch = harness.switchCalls.find(
@@ -489,7 +729,8 @@ describe('v2 session-frozen hot refresh', () => {
       expect(optionsAfter.temperature).toBe(0.2);
       expect(optionsAfter.thinking).toBeUndefined();
 
-      // A child first seen after the refresh gets the fresh profile.
+      // A targeted Apply admits the next child on the new profile.
+      writeOperation('parent-1', 'strong', 'switch', 'apply-strong');
       const secondChild = await captureFirstChild(harness, 'race-second');
       const secondSwitch = harness.switchCalls.find(
         (call) => call.sessionID === secondChild,
@@ -497,4 +738,53 @@ describe('v2 session-frozen hot refresh', () => {
       expect(secondSwitch?.model.id).toBe('claude-sonnet-4-5');
     });
   }, 20_000);
+
+  for (const sessionModelState of [false, undefined]) {
+    test(`global mode (${sessionModelState}) refreshes defaults and ignores stale operations`, async () => {
+      env.writeUserConfig({
+        ...hot('cheap'),
+        ...(sessionModelState === undefined ? {} : { sessionModelState }),
+      });
+
+      await withHarness(async (harness) => {
+        // The startup seed still runs: the table resolves the cheap preset.
+        await waitFor(() => sidebarModels().explorer === 'openai/gpt-5-mini');
+
+        // A child seen before any edit captures the startup profile.
+        const pre = await captureFirstChild(harness, 'frozen-pre');
+        expect(
+          harness.switchCalls.find((call) => call.sessionID === pre)?.model.id,
+        ).toBe('gpt-5-mini');
+
+        // Global refresh remains enabled, but a disk flag edit requires restart.
+        env.writeUserConfig({ sessionModelState: true, ...hot('strong') });
+        writeOperation('parent-1', 'cheap', 'switch', 'stale-on-marker');
+        await waitFor(
+          () => sidebarModels().explorer === 'anthropic/claude-sonnet-4-5',
+        );
+
+        // New siblings and nested children capture the latest global defaults.
+        const post = await captureFirstChild(harness, 'frozen-post');
+        expect(
+          harness.switchCalls.find((call) => call.sessionID === post)?.model.id,
+        ).toBe('claude-sonnet-4-5');
+        harness.parents.set('new-grandchild', pre);
+        await harness.invokePrompt({
+          sessionID: 'new-grandchild',
+          prompt: { text: 'nested' },
+        });
+        expect(
+          harness.switchCalls.find(
+            (call) => call.sessionID === 'new-grandchild',
+          )?.model.id,
+        ).toBe('claude-sonnet-4-5');
+        expect(
+          harness.switchCalls.filter((call) => call.sessionID === pre),
+        ).toHaveLength(1);
+        expect(
+          readTuiSnapshot(env.projectDir).sessionAgentModels['parent-1'],
+        ).toBeUndefined();
+      });
+    }, 20_000);
+  }
 });

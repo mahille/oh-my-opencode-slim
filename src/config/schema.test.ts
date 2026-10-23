@@ -23,6 +23,21 @@ import {
   resetMultiplexerDiagnostics,
 } from './schema';
 
+describe('sessionModelState', () => {
+  it('accepts only a boolean opt-in and leaves omission disabled', () => {
+    expect(PluginConfigSchema.parse({}).sessionModelState).toBeUndefined();
+    for (const enabled of [true, false]) {
+      expect(
+        PluginConfigSchema.parse({ sessionModelState: enabled })
+          .sessionModelState,
+      ).toBe(enabled);
+    }
+    expect(
+      PluginConfigSchema.safeParse({ sessionModelState: 'true' }).success,
+    ).toBe(false);
+  });
+});
+
 describe('ProviderModelIdSchema', () => {
   it('accepts and preserves model remainders with spaces and nested segments', () => {
     const ids = [

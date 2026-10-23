@@ -2,7 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { type PluginConfig, PluginConfigSchema } from './config/schema';
 import type { ReusableSessionSelection } from './utils/background-job-board';
+import { log } from './utils/logger';
 
 /**
  * Per-session alias/status projection for the clickable sidebar. Entries only
@@ -13,6 +15,21 @@ import type { ReusableSessionSelection } from './utils/background-job-board';
 export interface TuiSessionDetails {
   alias?: string;
   status?: 'busy' | 'retry';
+}
+
+/**
+ * Per-conversation sidebar projection recorded when a v2 root binds or
+ * explicitly switches its inference snapshot. Keyed by the
+ * ROOT sessionID (children share their parent's conversation). The sidebar
+ * uses that conversation's record as authoritative, including absent models
+ * and variants; the map is LRU-capped by `TUI_SESSION_AGENT_MODELS_MAX`.
+ */
+export interface TuiSessionAgentModels {
+  preset?: string;
+  agentModels: Record<string, string>;
+  agentVariants: Record<string, string>;
+  /** Last refresh time (ms); drives LRU eviction only, never rendered. */
+  updatedAt: number;
 }
 
 /** Host-board sidebar sessions. Running entries carry only stable identity;
@@ -64,9 +81,17 @@ export interface TuiSnapshot {
   reusableByAgent: Record<string, Record<string, TuiReusableSession[]>>;
   /** Host PID owning each parent projection, independent of activityPids. */
   reusableOwners: Record<string, number>;
+  /**
+   * Per-root-conversation agent model/variant/preset projections (v2 bind
+   * or targeted switch). The visible conversation's record is authoritative;
+   * absent or legacy files simply lack the section.
+   */
+  sessionAgentModels: Record<string, TuiSessionAgentModels>;
 }
 
 export const TUI_SESSION_PARENTS_MAX = 256;
+/** LRU cap on per-conversation sidebar projections, by `updatedAt`. */
+export const TUI_SESSION_AGENT_MODELS_MAX = 64;
 const STATE_DIR = 'oh-my-opencode-slim';
 const STATE_FILE = 'tui-state.json';
 const STATE_LOCK_RETRY_MS = 5;
@@ -104,6 +129,162 @@ export function getTuiStatePath(projectDir: string): string {
   );
 }
 
+/** Immutable TUI request carrying the captured effective config, not a shared
+ * disk reference. Server consumption initializes only unbound conversations
+ * or explicitly switches the target. Publication does not confirm application. */
+export interface TuiAttachMarker {
+  sessionID: string;
+  /** Random id per TUI process boot; embedded in every marker it writes. */
+  tuiBootID: string;
+  /** Observation time only; revision distinguishes same-millisecond writes. */
+  timestamp: number;
+  revision?: string;
+  kind?: 'initialize' | 'switch';
+  config?: PluginConfig;
+}
+
+// Per-TUI-process boot id; embedded in every marker from this process.
+const tuiAttachBootID = randomUUID();
+let tuiAttachRevision = 0;
+let tuiAttachTime = 0;
+
+export function getTuiAttachDir(projectDir: string): string {
+  return path.join(
+    dataDir(),
+    'opencode',
+    'storage',
+    STATE_DIR,
+    'tui-attach',
+    projectScope(projectDir),
+  );
+}
+
+export function getTuiAttachMarkerPath(
+  projectDir: string,
+  sessionID: string,
+): string {
+  return path.join(getTuiAttachDir(projectDir), `${sessionID}.json`);
+}
+
+/**
+ * Publish an immutable operation file for `sessionID` when options are given;
+ * the legacy two-argument form rewrites its compatibility marker. Atomic
+ * tmp+rename publication requests server consumption via watcher or prompt
+ * admission, not confirmation of application. Best-effort: write failures
+ * are logged, never thrown.
+ */
+export function writeTuiAttachMarker(
+  projectDir: string,
+  sessionID: string,
+  options?: Pick<TuiAttachMarker, 'kind' | 'config'>,
+): boolean {
+  if (!sessionID) return false;
+  try {
+    const timestamp = Math.max(Date.now(), tuiAttachTime);
+    tuiAttachTime = timestamp;
+    const revision = `${String(timestamp).padStart(16, '0')}-${String(++tuiAttachRevision).padStart(10, '0')}-${tuiAttachBootID}`;
+    const markerPath = options
+      ? path.join(getTuiAttachDir(projectDir), `${sessionID}.${revision}.json`)
+      : getTuiAttachMarkerPath(projectDir, sessionID);
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+    const marker: TuiAttachMarker = {
+      sessionID,
+      tuiBootID: tuiAttachBootID,
+      timestamp,
+      revision,
+      ...options,
+    };
+    const tmpPath = `${markerPath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      fs.writeFileSync(tmpPath, `${JSON.stringify(marker)}\n`);
+      fs.renameSync(tmpPath, markerPath);
+      if (options) pruneTuiAttachOperations(projectDir, sessionID);
+    } finally {
+      // Remove temp residue on the failure path; readers only ever open
+      // the final file.
+      try {
+        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      } catch {
+        // best-effort
+      }
+    }
+    return true;
+  } catch (error) {
+    log('[tui] failed to write TUI attach marker', String(error));
+    return false;
+  }
+}
+
+/** Bound disk usage while retaining recent immutable operations. A late
+ * initialize cannot erase the latest explicit switch, even across boots. */
+function pruneTuiAttachOperations(projectDir: string, sessionID: string): void {
+  try {
+    const dir = getTuiAttachDir(projectDir);
+    const entries = fs
+      .readdirSync(dir)
+      .filter(
+        (entry) => entry.startsWith(`${sessionID}.`) && entry.endsWith('.json'),
+      )
+      .map((entry) => ({
+        entry,
+        marker: readTuiAttachMarker(path.join(dir, entry)),
+      }))
+      .filter(
+        (item) => item.marker?.sessionID === sessionID && item.marker.revision,
+      )
+      .sort((a, b) =>
+        (b.marker?.revision ?? '').localeCompare(a.marker?.revision ?? ''),
+      );
+    const latestSwitch = entries.find((item) => item.marker?.kind === 'switch');
+    for (const item of entries.slice(64)) {
+      if (item !== latestSwitch) fs.unlinkSync(path.join(dir, item.entry));
+    }
+  } catch {
+    // Cleanup must not turn a successful atomic publication into a failure.
+  }
+}
+
+/** Parse an attach marker file. Missing or malformed files return null. */
+export function readTuiAttachMarker(
+  markerPath: string,
+): TuiAttachMarker | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    if (
+      typeof parsed.sessionID !== 'string' ||
+      parsed.sessionID === '' ||
+      typeof parsed.tuiBootID !== 'string' ||
+      typeof parsed.timestamp !== 'number' ||
+      !Number.isFinite(parsed.timestamp) ||
+      (parsed.revision !== undefined && typeof parsed.revision !== 'string') ||
+      (parsed.kind !== undefined &&
+        parsed.kind !== 'initialize' &&
+        parsed.kind !== 'switch')
+    ) {
+      return null;
+    }
+    return {
+      sessionID: parsed.sessionID,
+      tuiBootID: parsed.tuiBootID,
+      timestamp: parsed.timestamp,
+      ...(typeof parsed.revision === 'string'
+        ? { revision: parsed.revision }
+        : {}),
+      ...(parsed.kind === 'initialize' || parsed.kind === 'switch'
+        ? { kind: parsed.kind }
+        : {}),
+      ...(parsed.config !== undefined
+        ? { config: PluginConfigSchema.parse(parsed.config) }
+        : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function emptySnapshot(): TuiSnapshot {
   return {
     version: 1,
@@ -117,6 +298,7 @@ function emptySnapshot(): TuiSnapshot {
     sessionDetails: {},
     reusableByAgent: {},
     reusableOwners: {},
+    sessionAgentModels: {},
   };
 }
 
@@ -134,6 +316,37 @@ function parsePidRecord(value: unknown): Record<string, number> {
   const out: Record<string, number> = {};
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
     if (typeof entry === 'number' && entry > 0) out[key] = entry;
+  }
+  return out;
+}
+
+/**
+ * Per-conversation projection records. Malformed entries (non-object, or
+ * missing a usable `agentModels` record) are dropped without touching the
+ * valid ones; legacy files without the section parse as `{}`.
+ */
+function parseSessionAgentModels(
+  value: unknown,
+): Record<string, TuiSessionAgentModels> {
+  if (value === null || typeof value !== 'object') return {};
+  const out: Record<string, TuiSessionAgentModels> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (entry === null || typeof entry !== 'object') continue;
+    const rec = entry as {
+      agentModels?: unknown;
+      agentVariants?: unknown;
+      updatedAt?: unknown;
+      preset?: unknown;
+    };
+    if (rec.agentModels === null || typeof rec.agentModels !== 'object') {
+      continue;
+    }
+    out[key] = {
+      agentModels: parseStringRecord(rec.agentModels),
+      agentVariants: parseStringRecord(rec.agentVariants),
+      updatedAt: typeof rec.updatedAt === 'number' ? rec.updatedAt : 0,
+      ...(typeof rec.preset === 'string' ? { preset: rec.preset } : {}),
+    };
   }
   return out;
 }
@@ -237,6 +450,7 @@ function parseSnapshot(value: string): TuiSnapshot {
     // values parse as arrays for the TUI's reusable-session navigation.
     reusableByAgent: parseReusableByAgent(parsed.reusableByAgent),
     reusableOwners: parsePidRecord(parsed.reusableOwners),
+    sessionAgentModels: parseSessionAgentModels(parsed.sessionAgentModels),
   };
 }
 
@@ -468,7 +682,9 @@ export function snapshotSectionsEqual(a: TuiSnapshot, b: TuiSnapshot): boolean {
     JSON.stringify(a.sessionParents) === JSON.stringify(b.sessionParents) &&
     JSON.stringify(a.sessionDetails) === JSON.stringify(b.sessionDetails) &&
     JSON.stringify(a.reusableByAgent) === JSON.stringify(b.reusableByAgent) &&
-    JSON.stringify(a.reusableOwners) === JSON.stringify(b.reusableOwners)
+    JSON.stringify(a.reusableOwners) === JSON.stringify(b.reusableOwners) &&
+    JSON.stringify(a.sessionAgentModels) ===
+      JSON.stringify(b.sessionAgentModels)
   );
 }
 
@@ -569,6 +785,48 @@ export function recordTuiAgentModels(
       snapshot.agentDisplayNames = { ...input.agentDisplayNames };
     }
   });
+}
+
+/**
+ * Record the sidebar projection of ONE conversation's refreshed snapshot,
+ * keyed by its ROOT sessionID. Same lock/merge discipline as the global
+ * writers; never touches the global `agentModels`/`agentVariants`. The map
+ * is LRU-capped to the `TUI_SESSION_AGENT_MODELS_MAX` most recent records
+ * by `updatedAt`.
+ */
+export function recordSessionAgentModels(
+  projectDir: string,
+  sessionID: string,
+  projection: {
+    agentModels: Record<string, string>;
+    agentVariants?: Record<string, string>;
+    preset?: string;
+  },
+): void {
+  if (!sessionID) return;
+  updateSnapshot(projectDir, (snapshot) => {
+    snapshot.sessionAgentModels[sessionID] = {
+      agentModels: { ...projection.agentModels },
+      agentVariants: { ...(projection.agentVariants ?? {}) },
+      updatedAt: Date.now(),
+      ...(projection.preset !== undefined ? { preset: projection.preset } : {}),
+    };
+    capSessionAgentModels(snapshot.sessionAgentModels);
+  });
+}
+
+/** Evict the least-recently-updated records past the LRU cap. */
+function capSessionAgentModels(
+  records: Record<string, TuiSessionAgentModels>,
+): void {
+  if (Object.keys(records).length <= TUI_SESSION_AGENT_MODELS_MAX) return;
+  // Reverse insertion order first: for same-millisecond `updatedAt` ties
+  // (stable sort) the earliest record must land at the eviction tail.
+  const entries = Object.entries(records).reverse();
+  entries.sort((a, b) => b[1].updatedAt - a[1].updatedAt);
+  for (const [sessionID] of entries.slice(TUI_SESSION_AGENT_MODELS_MAX)) {
+    delete records[sessionID];
+  }
 }
 
 export function recordTuiAgentModel(

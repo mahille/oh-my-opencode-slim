@@ -54,7 +54,7 @@ The config system follows a layered architecture:
 
 3. Merging Phase
     ├─ User config (base) + ancestor project configs (farthest to closest) → deep merge
-   ├─ Preset resolution: preset → merge preset.agents with root agents
+    ├─ Preset resolution: explicit presetOverride (when supplied) → preset → merge preset.agents with root agents
    └─ Normalization: companion defaults, ACP agent defaults
 
 4. Runtime Phase

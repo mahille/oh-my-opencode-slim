@@ -5,19 +5,29 @@ import * as path from 'node:path';
 import {
   clearTuiAgentActivities,
   clearTuiSessionAlias,
+  getTuiAttachDir,
+  getTuiAttachMarkerPath,
   getTuiStatePath,
+  readTuiAttachMarker,
   readTuiSnapshot,
   readTuiSnapshotAsync,
+  recordSessionAgentModels,
   recordTuiAgentActivity,
   recordTuiAgentModel,
   recordTuiAgentModels,
   recordTuiSessionParent,
   resolveTuiSnapshotRoot,
   snapshotSectionsEqual,
+  TUI_SESSION_AGENT_MODELS_MAX,
   TUI_SESSION_PARENTS_MAX,
   updateSnapshot,
   updateTuiSessionDetails,
+  writeTuiAttachMarker,
 } from './tui-state';
+import {
+  readTuiAttachMarkersForSession,
+  watchTuiAttachMarkers,
+} from './v2/tui-attach';
 
 let previousXdgDataHome: string | undefined;
 let tempDir: string;
@@ -1041,5 +1051,285 @@ describe('sessionDetails (clickable sidebar projection)', () => {
     const parsed = readTuiSnapshot(tempDir);
     expect(parsed.sessionDetails).toEqual({});
     expect(parsed.agentModels).toEqual({ oracle: 'openai/gpt-6' });
+  });
+});
+
+describe('sessionAgentModels (per-conversation sidebar projection)', () => {
+  test('round-trips a conversation projection without touching the global rows', () => {
+    recordTuiAgentModels(
+      {
+        agentModels: { explorer: 'openai/gpt-6-global' },
+        agentVariants: { explorer: 'low' },
+      },
+      tempDir,
+    );
+
+    recordSessionAgentModels(tempDir, 'root-a', {
+      agentModels: { explorer: 'openai/gpt-6-session' },
+      agentVariants: { explorer: 'high' },
+    });
+
+    const snapshot = readTuiSnapshot(tempDir);
+    // The global projection is untouched by the per-session writer.
+    expect(snapshot.agentModels).toEqual({ explorer: 'openai/gpt-6-global' });
+    expect(snapshot.agentVariants).toEqual({ explorer: 'low' });
+    expect(snapshot.sessionAgentModels['root-a']).toEqual({
+      agentModels: { explorer: 'openai/gpt-6-session' },
+      agentVariants: { explorer: 'high' },
+      updatedAt: expect.any(Number),
+    });
+  });
+
+  test('re-recording a session refreshes its record, and empty agentVariants default', () => {
+    recordSessionAgentModels(tempDir, 'root-a', {
+      agentModels: { explorer: 'openai/gpt-6-a' },
+      agentVariants: { explorer: 'low' },
+    });
+    recordSessionAgentModels(tempDir, 'root-a', {
+      agentModels: { explorer: 'openai/gpt-6-b' },
+    });
+
+    const snapshot = readTuiSnapshot(tempDir);
+    expect(Object.keys(snapshot.sessionAgentModels)).toEqual(['root-a']);
+    expect(snapshot.sessionAgentModels['root-a']).toEqual({
+      agentModels: { explorer: 'openai/gpt-6-b' },
+      agentVariants: {},
+      updatedAt: expect.any(Number),
+    });
+  });
+
+  test('caps the projection map at the TUI_SESSION_AGENT_MODELS_MAX most recent', () => {
+    for (let i = 0; i <= TUI_SESSION_AGENT_MODELS_MAX + 1; i += 1) {
+      recordSessionAgentModels(tempDir, `root-${i}`, {
+        agentModels: { explorer: `openai/model-${i}` },
+      });
+    }
+
+    const { sessionAgentModels } = readTuiSnapshot(tempDir);
+    expect(Object.keys(sessionAgentModels)).toHaveLength(
+      TUI_SESSION_AGENT_MODELS_MAX,
+    );
+    // The two oldest records were evicted, the newest is kept.
+    expect(sessionAgentModels['root-0']).toBeUndefined();
+    expect(sessionAgentModels['root-1']).toBeUndefined();
+    expect(
+      sessionAgentModels[`root-${TUI_SESSION_AGENT_MODELS_MAX - 1}`],
+    ).toBeDefined();
+    expect(
+      sessionAgentModels[`root-${TUI_SESSION_AGENT_MODELS_MAX + 1}`],
+    ).toBeDefined();
+  });
+
+  test('snapshotSectionsEqual detects sessionAgentModels changes', () => {
+    recordSessionAgentModels(tempDir, 'root-a', {
+      agentModels: { explorer: 'openai/gpt-6' },
+    });
+    const base = readTuiSnapshot(tempDir);
+    const changed = readTuiSnapshot(tempDir);
+    changed.sessionAgentModels['root-a'].agentModels.explorer = 'openai/other';
+    expect(snapshotSectionsEqual(base, changed)).toBe(false);
+
+    const identical = readTuiSnapshot(tempDir);
+    expect(snapshotSectionsEqual(base, identical)).toBe(true);
+  });
+
+  test('parseSnapshot reads legacy files without the section and drops malformed entries', () => {
+    const filePath = getTuiStatePath(tempDir);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+
+    // Legacy file: no sessionAgentModels key at all.
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        updatedAt: 1,
+        agentModels: { explorer: 'openai/gpt-6' },
+      }),
+    );
+    const legacy = readTuiSnapshot(tempDir);
+    expect(legacy.sessionAgentModels).toEqual({});
+    expect(legacy.agentModels).toEqual({ explorer: 'openai/gpt-6' });
+
+    // Malformed entries are dropped without touching the valid ones.
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        updatedAt: 1,
+        sessionAgentModels: {
+          'good-root': {
+            agentModels: { explorer: 'openai/gpt-6' },
+            agentVariants: { explorer: 'low' },
+            updatedAt: 5,
+          },
+          'missing-models': {
+            agentVariants: { explorer: 'low' },
+            updatedAt: 6,
+          },
+          'string-models': { agentModels: 'nope', updatedAt: 7 },
+          nonObject: 'nope',
+          nullEntry: null,
+        },
+      }),
+    );
+    expect(readTuiSnapshot(tempDir).sessionAgentModels).toEqual({
+      'good-root': {
+        agentModels: { explorer: 'openai/gpt-6' },
+        agentVariants: { explorer: 'low' },
+        updatedAt: 5,
+      },
+    });
+  });
+});
+
+describe('tui attach markers', () => {
+  test('immutable operations distinguish equal timestamps and predate watcher registration', async () => {
+    const clock = spyOn(Date, 'now').mockReturnValue(Date.now());
+    const config = { preset: 'A', agents: { explorer: { model: 'openai/a' } } };
+    try {
+      expect(
+        writeTuiAttachMarker(tempDir, 'ses_a', { kind: 'initialize', config }),
+      ).toBe(true);
+      config.preset = 'B';
+      expect(
+        writeTuiAttachMarker(tempDir, 'ses_a', { kind: 'switch', config }),
+      ).toBe(true);
+      const pending = readTuiAttachMarkersForSession(tempDir, 'ses_a');
+      expect(pending.map((marker) => marker.kind)).toEqual([
+        'initialize',
+        'switch',
+      ]);
+      expect(pending.map((marker) => marker.config?.preset)).toEqual([
+        'A',
+        'B',
+      ]);
+      expect(pending[0].timestamp).toBe(pending[1].timestamp);
+      expect(pending[0].revision).not.toBe(pending[1].revision);
+      expect(readTuiAttachMarkersForSession(tempDir, 'ses_b')).toEqual([]);
+      const seen: string[] = [];
+      let complete!: () => void;
+      const done = new Promise<void>((resolve) => {
+        complete = resolve;
+      });
+      const handle = watchTuiAttachMarkers({
+        directory: tempDir,
+        watchImpl: () => ({ close() {} }),
+        onAttach: (sessionID, marker) => {
+          expect(sessionID).toBe('ses_a');
+          seen.push(marker.config?.preset ?? 'missing');
+          if (seen.length === 2) complete();
+        },
+      });
+      await done;
+      await handle.dispose();
+      expect(seen).toEqual(['A', 'B']);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test('later initialize retains a pending switch and pinned preset labels roundtrip', () => {
+    writeTuiAttachMarker(tempDir, 'ses_a', {
+      kind: 'switch',
+      config: { preset: 'B' },
+    });
+    writeTuiAttachMarker(tempDir, 'ses_a', {
+      kind: 'initialize',
+      config: { preset: 'A' },
+    });
+    expect(
+      readTuiAttachMarkersForSession(tempDir, 'ses_a').map(
+        (marker) => marker.kind,
+      ),
+    ).toEqual(['switch', 'initialize']);
+    recordSessionAgentModels(tempDir, 'ses_a', {
+      agentModels: {},
+      preset: 'B',
+    });
+    expect(readTuiSnapshot(tempDir).sessionAgentModels.ses_a.preset).toBe('B');
+  });
+
+  test('writeTuiAttachMarker creates the marker directory and roundtrips', () => {
+    const attachDir = getTuiAttachDir(tempDir);
+    expect(fs.existsSync(attachDir)).toBe(false);
+
+    expect(writeTuiAttachMarker(tempDir, 'ses_boot')).toBe(true);
+    expect(fs.existsSync(attachDir)).toBe(true);
+
+    const markerPath = getTuiAttachMarkerPath(tempDir, 'ses_boot');
+    const marker = readTuiAttachMarker(markerPath);
+    expect(marker).toEqual({
+      sessionID: 'ses_boot',
+      tuiBootID: expect.any(String),
+      timestamp: expect.any(Number),
+      revision: expect.any(String),
+    });
+    expect(marker?.tuiBootID).toHaveLength(36);
+    expect(marker?.timestamp).toBeGreaterThan(0);
+  });
+
+  test('rewriting a marker overwrites the previous one with a newer timestamp', () => {
+    expect(writeTuiAttachMarker(tempDir, 'ses_nav')).toBe(true);
+    const first = readTuiAttachMarker(
+      getTuiAttachMarkerPath(tempDir, 'ses_nav'),
+    );
+    expect(first).not.toBeNull();
+
+    // Same TUI process boot id across rewrites of the same session.
+    expect(writeTuiAttachMarker(tempDir, 'ses_nav')).toBe(true);
+    const second = readTuiAttachMarker(
+      getTuiAttachMarkerPath(tempDir, 'ses_nav'),
+    );
+    expect(second).not.toBeNull();
+    expect(second?.tuiBootID).toBe(first?.tuiBootID);
+    expect(second?.timestamp).toBeGreaterThanOrEqual(first?.timestamp ?? 0);
+  });
+
+  test('markers are scoped per project directory', () => {
+    const otherProject = path.join(tempDir, 'other-project');
+    expect(writeTuiAttachMarker(tempDir, 'ses_x')).toBe(true);
+    expect(fs.existsSync(getTuiAttachMarkerPath(otherProject, 'ses_x'))).toBe(
+      false,
+    );
+    expect(
+      readTuiAttachMarker(getTuiAttachMarkerPath(otherProject, 'ses_x')),
+    ).toBeNull();
+  });
+
+  test('empty sessionID is not written', () => {
+    expect(writeTuiAttachMarker(tempDir, '')).toBe(false);
+    expect(fs.existsSync(getTuiAttachDir(tempDir))).toBe(false);
+  });
+
+  test('readTuiAttachMarker ignores malformed and missing markers', () => {
+    const attachDir = getTuiAttachDir(tempDir);
+    fs.mkdirSync(attachDir, { recursive: true });
+
+    // Missing file.
+    expect(readTuiAttachMarker(path.join(attachDir, 'nope.json'))).toBeNull();
+
+    // Invalid JSON.
+    fs.writeFileSync(path.join(attachDir, 'bad-1.json'), '{not json');
+    expect(readTuiAttachMarker(path.join(attachDir, 'bad-1.json'))).toBeNull();
+
+    // Valid JSON, wrong shape.
+    fs.writeFileSync(
+      path.join(attachDir, 'bad-2.json'),
+      JSON.stringify({ sessionID: 42, tuiBootID: 'x', timestamp: 1 }),
+    );
+    expect(readTuiAttachMarker(path.join(attachDir, 'bad-2.json'))).toBeNull();
+    fs.writeFileSync(
+      path.join(attachDir, 'bad-3.json'),
+      JSON.stringify({ sessionID: 'ses_y', timestamp: 1 }),
+    );
+    expect(readTuiAttachMarker(path.join(attachDir, 'bad-3.json'))).toBeNull();
+    fs.writeFileSync(path.join(attachDir, 'bad-4.json'), JSON.stringify(null));
+    expect(readTuiAttachMarker(path.join(attachDir, 'bad-4.json'))).toBeNull();
+
+    // A valid marker next to the malformed ones still parses.
+    expect(writeTuiAttachMarker(tempDir, 'ses_y')).toBe(true);
+    expect(
+      readTuiAttachMarker(getTuiAttachMarkerPath(tempDir, 'ses_y')),
+    ).toEqual(expect.objectContaining({ sessionID: 'ses_y' }));
   });
 });

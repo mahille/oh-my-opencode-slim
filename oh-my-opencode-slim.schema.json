@@ -24,6 +24,10 @@
       "description": "Disable automatic installation of plugin updates when false. Defaults to true.",
       "type": "boolean"
     },
+    "sessionModelState": {
+      "description": "Opt in to conversation-owned model profiles and fallback chains on v2. Defaults to false: each new child captures the latest global defaults. The global config watcher remains enabled in both modes; existing children retain their captured state. Changing this flag requires service and TUI restart.",
+      "type": "boolean"
+    },
     "presets": {
       "type": "object",
       "propertyNames": {

@@ -116,6 +116,23 @@ async function withFactory(
 }
 
 describe('v2 profile refresh hook', () => {
+  test('resolves fresh profiles without writing the sidebar', async () => {
+    env.writeUserConfig(withPreset('cheap'));
+    await withFactory(async ({ hooks }) => {
+      const resolve = (
+        hooks as unknown as { 'v2.resolveProfiles': ProfilesHook }
+      )['v2.resolveProfiles'];
+      expect(typeof resolve).toBe('function');
+      const before = readTuiSnapshot(env.projectDir);
+      env.writeUserConfig(withPreset('strong'));
+      const result = await resolve();
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error(result.reason);
+      expect(result.profiles.explorer.model?.id).toBe('claude-sonnet-4-5');
+      expect(readTuiSnapshot(env.projectDir)).toEqual(before);
+    });
+  });
+
   test('re-reads the config, resolves profiles, and rewrites the sidebar model entries', async () => {
     env.writeUserConfig(withPreset('cheap'));
 
@@ -535,6 +552,42 @@ const chainConfig = (chain: string[]) => ({
 });
 
 describe('v2 chain refresh', () => {
+  for (const sessionModelState of [true, false, undefined]) {
+    test(`dispatch chains respect the startup opt-in (${sessionModelState}) while running chains stay pinned`, async () => {
+      const original = { orchestrator: [{ id: 'test/a' }, { id: 'old/b' }] };
+      env.writeUserConfig({
+        ...chainConfig(['test/a', 'old/b']),
+        ...(sessionModelState === undefined ? {} : { sessionModelState }),
+      });
+      await withFactory(async ({ hooks, refresh }) => {
+        const extensions = hooks as HooksWithV2;
+        extensions['v2.pinSessionChains']?.('old-child', original);
+        // Changing the flag on disk must not change the startup-frozen gate.
+        env.writeUserConfig({
+          ...chainConfig(['test/x', 'fresh/y']),
+          sessionModelState: !sessionModelState,
+        });
+        expect((await refresh()).ok).toBe(true);
+        expect(
+          await retryOnce(extensions, 'old-child', 'orchestrator', 'test/a'),
+        ).toBe('old/b');
+        expect(
+          extensions['v2.resolveDelegatedModel']?.({
+            agentType: 'orchestrator',
+            parentSessionID: 'old-child',
+          }),
+        ).toBe(sessionModelState ? 'old/b' : 'fresh/y');
+        extensions['v2.setSessionDispatchChains']?.('old-child', original);
+        expect(
+          extensions['v2.resolveDelegatedModel']?.({
+            agentType: 'orchestrator',
+            parentSessionID: 'old-child',
+          }),
+        ).toBe(sessionModelState ? 'old/b' : 'fresh/y');
+      });
+    });
+  }
+
   test('refresh republishes chains: new children use the new chain, never removed models', async () => {
     env.writeUserConfig(chainConfig(['test/a', 'test/b', 'test/c']));
     await withFactory(async ({ hooks, refresh }) => {

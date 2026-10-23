@@ -16,18 +16,17 @@
  * backed (older/reduced hosts); when neither yields models the flow toasts
  * guidance instead of failing.
  *
- * Mutation semantics are identical to v1, deliberately: preset edits and the
- * selected preset name are persisted to the user config file. After a
- * successful write the manager runs the shared live-refresh seam
- * (`onConfigChanged`): the request asks the server-side watcher to refresh
- * the runtime profiles used by NEW child dispatches and the TUI sidebar
- * re-reads its config-backed rows, while running sessions keep their captured
- * profiles. The TUI process CANNOT observe the server watcher's outcome
- * (separate process; the supported host exposes no safe plugin RPC bridge
- * between the server and TUI entries), so a successful toast says the refresh
- * was requested — never that it was applied — and a failed/missing request
- * path degrades to the actionable reload fallback. The manager never reloads
- * the host registry itself.
+ * Preset edits and the selected preset name are persisted to user config.
+ * After a successful write, `onConfigChanged` distinguishes Save from Apply:
+ * Save only notifies config listeners, never switching bound conversations.
+ * For Apply / Save & Apply, the adapter synchronously publishes an immutable
+ * effective-config marker for the conversation captured when the dialog
+ * opened, or updates this TUI's future-root default when no target exists.
+ * The server consumes markers through its watcher and prompt admission;
+ * existing children retain their captured profiles. The TUI cannot observe
+ * server application, so success toasts say refresh was requested, never
+ * applied; a failed/missing request shows the reload fallback. The manager
+ * never reloads the host registry itself.
  *
  * Host types are hand-mirrored and capability-guarded — the v2 plugin package
  * is not a build-time dependency (same convention as `src/v2/tui.ts`).
@@ -163,13 +162,17 @@ export interface V2PresetManagerContext {
   };
   client?: unknown;
   /** Runs after a successful config write (Save / Save & Apply / Apply).
-   * This is a REQUEST seam: on the supported host it asks the server-side
-   * watcher to refresh the runtime profiles and re-reads the TUI sidebar
-   * state, but cannot observe the server watcher's outcome. Return
+   * Save only notifies config listeners. Apply synchronously publishes the
+   * captured target's immutable-config marker before returning a refresh
+   * request promise; without a target it updates only this TUI's default.
+   * This seam cannot observe server application. Return
    * `{ ok: false, reason }` (or reject) when the request itself failed; the
    * manager then shows the actionable reload fallback — it never claims the
    * refresh was applied. */
-  onConfigChanged?: () =>
+  onConfigChanged?: (change?: {
+    kind: 'save' | 'apply';
+    presetName: string;
+  }) =>
     | undefined
     | V2LiveRefreshResult
     | Promise<undefined | V2LiveRefreshResult>;
@@ -302,7 +305,7 @@ function toast(
 }
 
 /** Success text for a completed config write: says the refresh was REQUESTED
- * (the TUI cannot observe the server watcher), never applied. */
+ * (the TUI cannot observe server application), never applied. */
 export function liveRefreshSuccessMessage(
   presetName: string,
   summary: string[] = [],
@@ -325,6 +328,7 @@ async function reportConfigWrite(
   presetName: string,
   title: string,
   summary: string[] = [],
+  kind: 'save' | 'apply' = 'save',
 ): Promise<void> {
   const hook = run.ctx.onConfigChanged;
   if (typeof hook !== 'function') {
@@ -339,7 +343,7 @@ async function reportConfigWrite(
     );
   }
   try {
-    const result = await hook();
+    const result = await hook({ kind, presetName });
     if (result?.ok === false) {
       throw new Error(result.reason ?? 'live refresh request failed');
     }
@@ -500,7 +504,7 @@ async function applyPresetWithMessage(
     toast(run.ctx, 'warning', 'Preset switch failed', result.message);
     return;
   }
-  await reportConfigWrite(run, presetName, title, result.summary);
+  await reportConfigWrite(run, presetName, title, result.summary, 'apply');
 }
 
 type DeleteResult = 'deleted' | 'cancelled' | 'dismiss';

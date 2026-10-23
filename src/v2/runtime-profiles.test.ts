@@ -4,6 +4,7 @@ import {
   createSessionProfileBridge,
   reconcileRuntimeProfileOptionKeys,
   resolveV2EventPayload,
+  type SessionProfileBridgeOptions,
 } from './runtime-profiles';
 import type { ModelRef, V2SessionContextEvent } from './types';
 
@@ -19,7 +20,16 @@ const PROFILES = {
   },
 };
 
+/** The resolver's sidebar projection (carried on every ok result). */
+const PROJECTION = {
+  agentModels: { explorer: 'openai/gpt-5-mini' },
+  agentVariants: {},
+};
+
 interface BridgeOptions {
+  sessionModelState?: boolean;
+  snapshots?: SessionProfileBridgeOptions['snapshots'];
+  resolveFreshProfiles?: SessionProfileBridgeOptions['resolveFreshProfiles'];
   withSwitchModel?: boolean;
   switchModel?: (input: unknown) => Promise<unknown>;
   get?: (input: unknown) => Promise<unknown>;
@@ -31,8 +41,10 @@ interface BridgeOptions {
   pluginAgents?: string[];
   /** Bound for the request-path switch. */
   switchTimeoutMs?: number;
-  onSessionCaptured?: (sessionID: string) => void;
+  onSessionCaptured?: SessionProfileBridgeOptions['onSessionCaptured'];
+  chains?: SessionProfileBridgeOptions['chains'];
   onSessionCaptureFailed?: (sessionID: string) => void;
+  onRootSnapshot?: SessionProfileBridgeOptions['onRootSnapshot'];
 }
 
 function makeBridge(options?: BridgeOptions) {
@@ -53,6 +65,10 @@ function makeBridge(options?: BridgeOptions) {
     };
   }
   const bridge = createSessionProfileBridge({
+    sessionModelState: options?.sessionModelState ?? true,
+    snapshots: options?.snapshots,
+    chains: options?.chains,
+    resolveFreshProfiles: options?.resolveFreshProfiles,
     profiles: options?.profiles ?? (() => PROFILES),
     registeredProfiles: options?.registeredProfiles,
     pluginAgents: new Set(options?.pluginAgents ?? ['explorer', 'oracle']),
@@ -66,6 +82,9 @@ function makeBridge(options?: BridgeOptions) {
       : {}),
     ...(options?.onSessionCaptureFailed
       ? { onSessionCaptureFailed: options.onSessionCaptureFailed }
+      : {}),
+    ...(options?.onRootSnapshot
+      ? { onRootSnapshot: options.onRootSnapshot }
       : {}),
     log: () => {},
   });
@@ -85,6 +104,255 @@ const GPT5_SWITCH = {
 };
 
 describe('createSessionProfileBridge', () => {
+  for (const sessionModelState of [false, undefined]) {
+    test(`global mode (${sessionModelState}) captures latest profiles and chains for nested children without root lookup`, async () => {
+      let profiles = PROFILES;
+      let chains = { explorer: [{ id: 'openai/old-backup' }] };
+      const snapshots = new Map();
+      const pins = new Map();
+      const bridge = createSessionProfileBridge({
+        sessionModelState,
+        snapshots,
+        profiles: () => profiles,
+        chains: () => chains,
+        pluginAgents: new Set(['explorer']),
+        session: {
+          get: async () => {
+            throw new Error('must not look up parents');
+          },
+          switchModel: async () => ({}),
+        } as never,
+        resolveFreshProfiles: async () => {
+          throw new Error('must not resolve roots');
+        },
+        beforeSessionCapture: async () => {
+          throw new Error('must not consume markers');
+        },
+        onRootSnapshot: () => {
+          throw new Error('must not project roots');
+        },
+        onSessionCaptured: (id, table) => pins.set(id, table),
+      });
+      await bridge.refreshRootSnapshot('root', { kind: 'switch' });
+      await bridge.observeEvent(created('old', 'explorer', 'root'));
+      const oldChains = chains;
+      profiles = {
+        ...PROFILES,
+        explorer: {
+          ...PROFILES.explorer,
+          model: { providerID: 'other', id: 'latest' },
+        },
+      };
+      chains = { explorer: [{ id: 'other/latest-backup' }] };
+      await bridge.observeEvent(created('later-sibling', 'explorer', 'root'));
+      await bridge.observeEvent(created('grandchild', 'explorer', 'old'));
+      expect(bridge.profileForSession('old')).toBe(PROFILES.explorer);
+      expect(pins.get('old')).toBe(oldChains);
+      for (const id of ['later-sibling', 'grandchild']) {
+        expect(bridge.profileForSession(id)).toBe(profiles.explorer);
+        expect(pins.get(id)).toBe(chains);
+      }
+      expect(snapshots.size).toBe(0);
+    });
+  }
+
+  test('binds roots once and switches only targeted future descendants, including chains', async () => {
+    const snapshots = new Map();
+    const strong = {
+      ...PROFILES,
+      explorer: {
+        ...PROFILES.explorer,
+        model: { providerID: 'other', id: 'strong' },
+      },
+    };
+    const originalChains = { explorer: [{ id: 'openai/original-fallback' }] };
+    const strongChains = { explorer: [{ id: 'other/strong-fallback' }] };
+    const pins = new Map();
+    let disk = 'original';
+    let resolutions = 0;
+    const { bridge, switchCalls } = makeBridge({
+      snapshots,
+      get: async () => ({ agent: 'explorer' }),
+      resolveFreshProfiles: async (options) => {
+        resolutions += 1;
+        const selected = options?.config?.preset ?? disk;
+        return {
+          ok: true,
+          profiles: selected === 'strong' ? strong : PROFILES,
+          chains: selected === 'strong' ? strongChains : originalChains,
+          projection: PROJECTION,
+        };
+      },
+      onSessionCaptured: (id, chains) => pins.set(id, chains),
+    });
+    for (const root of ['root-a', 'root-b']) {
+      await bridge.refreshRootSnapshot(root, {
+        kind: 'initialize',
+        config: { preset: 'original' },
+        operationID: `initialize-${root}`,
+      });
+      await bridge.ensureSessionProfile(root);
+    }
+    expect(switchCalls).toEqual([]);
+    await bridge.observeEvent(created('old-a', 'explorer', 'root-a'));
+    disk = 'strong';
+    await bridge.refreshRootSnapshot('root-b');
+    await bridge.refreshRootSnapshot('root-b', {
+      kind: 'initialize',
+      config: { preset: 'strong' },
+      operationID: 'navigate-b',
+    });
+    expect(resolutions).toBe(2);
+    await bridge.observeEvent(created('new-b', 'explorer', 'root-b'));
+    await bridge.refreshRootSnapshot('root-a', {
+      kind: 'switch',
+      config: { preset: 'strong' },
+      operationID: 'switch-a',
+    });
+    // A duplicate operation cannot roll back a newer binding or re-resolve disk.
+    await bridge.refreshRootSnapshot('root-a', {
+      kind: 'switch',
+      config: { preset: 'original' },
+      operationID: 'switch-a',
+    });
+    expect(resolutions).toBe(3);
+    await bridge.observeEvent(created('new-a', 'explorer', 'root-a'));
+    await bridge.observeEvent(created('grandchild', 'explorer', 'old-a'));
+    await bridge.observeEvent(
+      created('great-grandchild', 'explorer', 'grandchild'),
+    );
+    for (const id of ['old-a', 'new-b', 'grandchild', 'great-grandchild']) {
+      expect(bridge.profileForSession(id)).toBe(PROFILES.explorer);
+      expect(pins.get(id)).toBe(originalChains);
+    }
+    expect(bridge.profileForSession('new-a')).toBe(strong.explorer);
+    expect(pins.get('new-a')).toBe(strongChains);
+    expect(snapshots.get('root-b')).toBe(PROFILES);
+    expect(snapshots.get('root-a')).toBe(strong);
+  });
+
+  test('skips non-root and foreign sessions without switching models', async () => {
+    const snapshots = new Map();
+    const { bridge, switchCalls, getCalls } = makeBridge({
+      snapshots,
+      get: async (input) =>
+        (input as { sessionID: string }).sessionID === 'child'
+          ? { parentID: 'root', agent: 'explorer' }
+          : { agent: 'foreign' },
+      resolveFreshProfiles: async () => ({
+        ok: true,
+        profiles: PROFILES,
+        projection: PROJECTION,
+      }),
+    });
+    for (const id of ['child', 'foreign', 'child', 'foreign']) {
+      await bridge.refreshRootSnapshot(id);
+    }
+    expect(snapshots.size).toBe(0);
+    expect(switchCalls).toEqual([]);
+    expect(getCalls).toHaveLength(2);
+  });
+
+  test('invalid switch retains last-good binding and invalid first admission pins defaults once', async () => {
+    const snapshots = new Map();
+    let valid = true;
+    let profiles = PROFILES;
+    const published: string[] = [];
+    const { bridge } = makeBridge({
+      snapshots,
+      get: async () => ({ agent: 'explorer' }),
+      resolveFreshProfiles: async () =>
+        valid
+          ? { ok: true, profiles, projection: PROJECTION }
+          : { ok: false, reason: 'invalid config' },
+      onRootSnapshot: (id) => published.push(id),
+    });
+    await bridge.refreshRootSnapshot('root-a');
+    valid = false;
+    await bridge.refreshRootSnapshot('root-a', {
+      kind: 'switch',
+      config: { preset: 'invalid' },
+      operationID: 'invalid-switch',
+    });
+    await bridge.refreshRootSnapshot('root-b');
+    expect(snapshots.get('root-a')).toBe(PROFILES);
+    expect(snapshots.get('root-b')).toBe(PROFILES);
+    expect(published).toEqual(['root-a']);
+    valid = true;
+    profiles = {
+      ...PROFILES,
+      explorer: { ...PROFILES.explorer, temperature: 0.9 },
+    };
+    await bridge.refreshRootSnapshot('root-a');
+    await bridge.refreshRootSnapshot('root-b');
+    await bridge.observeEvent(created('after-invalid-a', 'explorer', 'root-a'));
+    await bridge.observeEvent(created('after-invalid-b', 'explorer', 'root-b'));
+    expect(bridge.profileForSession('after-invalid-a')).toBe(PROFILES.explorer);
+    expect(bridge.profileForSession('after-invalid-b')).toBe(PROFILES.explorer);
+    expect(published).toEqual(['root-a']);
+  });
+
+  test('onRootSnapshot fires only for plugin-root refreshes, with the resolver projection', async () => {
+    const calls: Array<{ sessionID: string; projection: unknown }> = [];
+    let ok = true;
+    const { bridge } = makeBridge({
+      get: async (input) => {
+        const id = (input as { sessionID: string }).sessionID;
+        if (id === 'child') return { parentID: 'root', agent: 'explorer' };
+        if (id === 'foreign') return { agent: 'build' };
+        return { agent: 'explorer' };
+      },
+      resolveFreshProfiles: async () =>
+        ok
+          ? { ok: true, profiles: PROFILES, projection: PROJECTION }
+          : { ok: false, reason: 'invalid config' },
+      onRootSnapshot: (sessionID, projection) => {
+        calls.push({ sessionID, projection });
+      },
+    });
+
+    // A plugin root refresh fires with the resolver's projection...
+    await bridge.refreshRootSnapshot('root');
+    expect(calls).toEqual([{ sessionID: 'root', projection: PROJECTION }]);
+
+    // ...but children and foreign roots never do.
+    await bridge.refreshRootSnapshot('child');
+    await bridge.refreshRootSnapshot('foreign');
+    expect(calls).toEqual([{ sessionID: 'root', projection: PROJECTION }]);
+
+    // A failed resolution uses last-good defaults and emits no success projection.
+    ok = false;
+    await bridge.refreshRootSnapshot('root-2');
+    expect(calls).toEqual([{ sessionID: 'root', projection: PROJECTION }]);
+  });
+
+  test('retains authoritative snapshots beyond bookkeeping limits and cleans deleted roots', async () => {
+    const snapshots = new Map();
+    const { bridge, getCalls } = makeBridge({
+      snapshots,
+      get: async () => ({ agent: 'explorer' }),
+      resolveFreshProfiles: async () => ({
+        ok: true,
+        profiles: PROFILES,
+        projection: PROJECTION,
+      }),
+    });
+    for (let i = 0; i < 1025; i++) {
+      await bridge.refreshRootSnapshot(`root-${i}`);
+    }
+    expect(snapshots.size).toBe(1025);
+    expect(snapshots.get('root-0')).toBe(PROFILES);
+    await bridge.refreshRootSnapshot('root-0');
+    expect(getCalls).toHaveLength(1025);
+    await bridge.observeEvent({
+      type: 'session.deleted',
+      data: { sessionID: 'root-0' },
+    });
+    expect(snapshots.has('root-0')).toBe(false);
+    await bridge.refreshRootSnapshot('root-0');
+    expect(snapshots.has('root-0')).toBe(false);
+  });
+
   test('captures a newly seen plugin child and switches its model', async () => {
     const { bridge, switchCalls } = makeBridge();
 
@@ -199,7 +467,9 @@ describe('createSessionProfileBridge', () => {
       profiles: () => profiles,
       registeredProfiles: PROFILES,
       get: async (input) => ({
-        parentID: 'parent',
+        ...(['p', 'parent'].includes((input as { sessionID: string }).sessionID)
+          ? {}
+          : { parentID: 'parent' }),
         agent: 'explorer',
         model: models[(input as { sessionID: string }).sessionID],
       }),
@@ -299,12 +569,17 @@ describe('createSessionProfileBridge', () => {
     expect(switchCalls).toHaveLength(2);
   });
 
-  test('bounded capture map evicts oldest entries', async () => {
+  test('retains captured children beyond bookkeeping limits until deletion', async () => {
     const { bridge } = makeBridge();
     for (let index = 0; index < 1100; index += 1) {
       await bridge.observeEvent(created(`child-${index}`, 'oracle'));
     }
-    expect(bridge.size()).toBeLessThanOrEqual(1024);
+    expect(bridge.size()).toBe(1100);
+    expect(bridge.profileForSession('child-0')).toBe(PROFILES.oracle);
+    await bridge.observeEvent({
+      type: 'session.deleted',
+      data: { sessionID: 'child-0' },
+    });
     expect(bridge.profileForSession('child-0')).toBeUndefined();
   });
 
@@ -319,7 +594,10 @@ describe('createSessionProfileBridge', () => {
 
     await bridge.ensureSessionProfile('child-1');
 
-    expect(getCalls).toEqual([{ sessionID: 'child-1' }]);
+    expect(getCalls).toEqual([
+      { sessionID: 'child-1' },
+      { sessionID: 'parent' },
+    ]);
     expect(switchCalls).toEqual([GPT5_SWITCH]);
     expect(bridge.profileForSession('child-1')?.temperature).toBe(0.3);
   });
@@ -433,7 +711,7 @@ describe('createSessionProfileBridge', () => {
 
     // Frozen: a second prompt never re-queries or switches.
     await bridge.ensureSessionProfile('mkt-1');
-    expect(getCalls).toHaveLength(1);
+    expect(getCalls).toEqual([{ sessionID: 'mkt-1' }, { sessionID: 'p' }]);
     expect(switchCalls).toHaveLength(0);
   });
 
@@ -459,12 +737,14 @@ describe('createSessionProfileBridge', () => {
   });
 
   test('ensureSessionProfile awaits switchModel without racing a timeout', async () => {
+    const entered = Promise.withResolvers<void>();
     let finishSwitch: (() => void) | undefined;
     const { bridge } = makeBridge({
       get: async () => ({ id: 'c1', parentID: 'p', agent: 'explorer' }),
       switchModel: () =>
         new Promise<void>((resolve) => {
           finishSwitch = resolve;
+          entered.resolve();
         }),
     });
     let finished = false;
@@ -472,7 +752,7 @@ describe('createSessionProfileBridge', () => {
       finished = true;
     });
 
-    await Bun.sleep(10);
+    await entered.promise;
     expect(finished).toBe(false);
     expect(bridge.profileForSession('c1')).toBeUndefined();
     finishSwitch?.();

@@ -67,6 +67,8 @@ export interface ConfigLoadWarning {
  * Options for loadPluginConfig.
  */
 export interface LoadPluginConfigOptions {
+  /** Explicit selection captured by the caller, applied before preset merges. */
+  presetOverride?: string;
   /**
    * Called with a warning whenever config loading produces a non-fatal issue.
    * The loader still falls back to defaults and continues normally.
@@ -855,7 +857,8 @@ export function loadPluginConfig(
   }
 
   // Override preset from environment variable if set
-  const envPreset = process.env.OH_MY_OPENCODE_SLIM_PRESET;
+  const envPreset =
+    options?.presetOverride ?? process.env.OH_MY_OPENCODE_SLIM_PRESET;
   if (envPreset) {
     config.preset = envPreset;
   }

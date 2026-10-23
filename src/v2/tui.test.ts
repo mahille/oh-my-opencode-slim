@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { PluginConfig } from '../config';
-import baseTui from '../tui';
+import baseTui, { publishTuiPresetSwitch } from '../tui';
 import { recordTuiAgentActivity, recordTuiSessionParent } from '../tui-state';
 import { registerConfigChangeListener } from './config-change-coordinator';
 import tui2Plugin, {
@@ -11,6 +11,7 @@ import tui2Plugin, {
   runPresetFlow,
   type V2TuiPluginContext,
 } from './tui';
+import { readTuiAttachMarkersForSession } from './tui-attach';
 
 function makeConfig(): PluginConfig {
   return {
@@ -68,6 +69,7 @@ describe('v2 tui preset plugin', () => {
     configHome = fs.mkdtempSync(path.join(os.tmpdir(), 'omos-tui2-cfg-'));
     projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'omos-tui2-proj-'));
     process.env.OPENCODE_CONFIG_DIR = configHome;
+    process.env.XDG_DATA_HOME = path.join(configHome, 'data');
   });
 
   afterEach(() => {
@@ -80,6 +82,31 @@ describe('v2 tui preset plugin', () => {
   });
 
   describe('applyPresetByName', () => {
+    test('malformed config fallback never publishes over the last valid switch', () => {
+      const owner = {};
+      writeUserConfig({
+        sessionModelState: true,
+        preset: 'cheap',
+        presets: { cheap: { explorer: { model: 'openai/cheap' } } },
+      });
+      expect(
+        publishTuiPresetSwitch(owner, projectDir, 'cheap', 'ses_a').ok,
+      ).toBe(true);
+      const previous = readTuiAttachMarkersForSession(projectDir, 'ses_a');
+      for (const invalid of [
+        '{broken',
+        JSON.stringify({ agents: 'invalid' }),
+      ]) {
+        fs.writeFileSync(userConfigPath(), invalid);
+        expect(
+          publishTuiPresetSwitch(owner, projectDir, 'cheap', 'ses_a').ok,
+        ).toBe(false);
+        expect(readTuiAttachMarkersForSession(projectDir, 'ses_a')).toEqual(
+          previous,
+        );
+      }
+    });
+
     test('persists the preset name and returns a success message', () => {
       writeUserConfig({
         presets: {
@@ -292,6 +319,140 @@ describe('v2 tui preset plugin', () => {
       }
     });
 
+    test('publishes a captured config synchronously to only the command target when enabled', async () => {
+      writeUserConfig({
+        preset: 'balanced',
+        sessionModelState: true,
+        presets: {
+          balanced: { explorer: { model: 'openai/balanced' } },
+          cheap: { explorer: { model: 'openai/cheap' } },
+        },
+      });
+      const ctx = {
+        location: { directory: projectDir },
+        ui: {
+          router: { current: () => ({ type: 'session', sessionID: 'ses_a' }) },
+        },
+      };
+      const pending = runPresetFlow(ctx, 'cheap');
+      const markers = readTuiAttachMarkersForSession(projectDir, 'ses_a');
+      expect(markers).toHaveLength(1);
+      expect(markers[0].kind).toBe('switch');
+      expect(markers[0].config?.preset).toBe('cheap');
+      expect(markers[0].config?.agents?.explorer?.model).toBe('openai/cheap');
+      expect(readTuiAttachMarkersForSession(projectDir, 'ses_b')).toEqual([]);
+      writeUserConfig({ preset: 'balanced' });
+      expect(
+        readTuiAttachMarkersForSession(projectDir, 'ses_a')[0].config?.preset,
+      ).toBe('cheap');
+      await pending;
+    });
+
+    test('manager Apply targets the conversation captured when the dialog opened, not the later route', async () => {
+      writeUserConfig({
+        sessionModelState: true,
+        preset: 'balanced',
+        presets: {
+          balanced: { explorer: { model: 'openai/balanced' } },
+          cheap: { explorer: { model: 'openai/cheap' } },
+        },
+      });
+      let route = 'ses_a';
+      const choices = ['cheap', 'apply'];
+      const ctx = {
+        location: { directory: projectDir },
+        ui: {
+          router: { current: () => ({ type: 'session', sessionID: route }) },
+          dialog: {
+            select: async () => {
+              route = 'ses_b';
+              return choices.shift();
+            },
+            prompt: async () => undefined,
+            confirm: async () => undefined,
+          },
+        },
+      };
+      await runPresetFlow(ctx);
+      expect(
+        readTuiAttachMarkersForSession(projectDir, 'ses_a').map(
+          (marker) => marker.kind,
+        ),
+      ).toEqual(['switch']);
+      expect(readTuiAttachMarkersForSession(projectDir, 'ses_b')).toEqual([]);
+    });
+
+    for (const enabled of [false, undefined]) {
+      test(`disabled (${enabled}) Apply persists and notifies without session markers`, async () => {
+        const config = {
+          sessionModelState: enabled,
+          preset: 'balanced',
+          presets: {
+            balanced: { explorer: { model: 'openai/balanced' } },
+            cheap: { explorer: { model: 'openai/cheap' } },
+          },
+        };
+        writeUserConfig(config);
+        const stub = makeStubCtx({ selects: ['balanced', 'apply'] });
+        Object.assign(stub.ctx.ui, {
+          router: { current: () => ({ type: 'session', sessionID: 'ses_a' }) },
+        });
+        let notifications = 0;
+        const unregister = registerConfigChangeListener(projectDir, () => {
+          notifications += 1;
+          return { ok: true };
+        });
+        try {
+          await runPresetFlow(stub.ctx, 'cheap');
+          // Even an Apply after a disk edit cannot enable this TUI owner.
+          writeUserConfig({ ...config, sessionModelState: true });
+          await runPresetFlow(stub.ctx);
+          expect(readUserConfig().preset).toBe('balanced');
+          expect(notifications).toBe(2);
+          expect(readTuiAttachMarkersForSession(projectDir, 'ses_a')).toEqual(
+            [],
+          );
+          expect(
+            stub.toasts.every((text) =>
+              text.includes('Live refresh requested'),
+            ),
+          ).toBe(true);
+        } finally {
+          unregister();
+        }
+      });
+    }
+
+    test('enabled manager Save never publishes a conversation switch', async () => {
+      writeUserConfig({
+        sessionModelState: true,
+        preset: 'balanced',
+        presets: {
+          balanced: { explorer: { model: 'openai/balanced' } },
+          cheap: { explorer: { model: 'openai/cheap' } },
+        },
+      });
+      const stub = makeStubCtx({
+        selects: ['cheap', 'edit', '__omo_save__', undefined],
+      });
+      Object.assign(stub.ctx.ui, {
+        router: { current: () => ({ type: 'session', sessionID: 'ses_a' }) },
+      });
+      let notifications = 0;
+      const unregister = registerConfigChangeListener(projectDir, () => {
+        notifications += 1;
+        return { ok: true };
+      });
+      try {
+        await runPresetFlow(stub.ctx);
+        expect(notifications).toBe(1);
+        expect(readUserConfig().preset).toBe('balanced');
+        expect(readTuiAttachMarkersForSession(projectDir, 'ses_a')).toEqual([]);
+      } finally {
+        unregister();
+      }
+    });
+
     test('reports honestly when no live refresh listener is registered', async () => {
       writeUserConfig({
         presets: { cheap: { orchestrator: { model: 'openai/gpt-5-mini' } } },
@@ -499,6 +660,41 @@ describe('v2 tui preset plugin', () => {
       expect(tui2Plugin.tui).toBe(baseTui.tui);
       expect(typeof tui2Plugin.setup).toBe('function');
     });
+
+    for (const sessionModelState of [false, undefined]) {
+      test(`startup (${sessionModelState}) stays disabled after disk enables the feature`, async () => {
+        const config = {
+          sessionModelState,
+          preset: 'balanced',
+          presets: {
+            balanced: { explorer: { model: 'openai/balanced' } },
+            cheap: { explorer: { model: 'openai/cheap' } },
+          },
+        };
+        writeUserConfig(config);
+        const stub = makeSetupCtx();
+        const ctx = stub.ctx as unknown as V2TuiPluginContext;
+        ctx.ui.router.current = () => ({ type: 'session', sessionID: 'ses_a' });
+        const cleanup = await tui2Plugin.setup(ctx);
+        const unregister = registerConfigChangeListener(projectDir, () => ({
+          ok: true,
+        }));
+        try {
+          expect(readTuiAttachMarkersForSession(projectDir, 'ses_a')).toEqual(
+            [],
+          );
+          writeUserConfig({ ...config, sessionModelState: true });
+          await runPresetFlow(ctx, 'cheap');
+          expect(readUserConfig().preset).toBe('cheap');
+          expect(readTuiAttachMarkersForSession(projectDir, 'ses_a')).toEqual(
+            [],
+          );
+        } finally {
+          unregister();
+          cleanup?.();
+        }
+      });
+    }
 
     test('setup registers the sidebar slot and the /preset layer in the app slot render', async () => {
       const stub = makeSetupCtx();

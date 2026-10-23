@@ -983,6 +983,12 @@ export const RawPluginConfigSchema = z
       .describe(
         'Disable automatic installation of plugin updates when false. Defaults to true.',
       ),
+    sessionModelState: z
+      .boolean()
+      .optional()
+      .describe(
+        'Opt in to conversation-owned model profiles and fallback chains on v2. Defaults to false: each new child captures the latest global defaults. The global config watcher remains enabled in both modes; existing children retain their captured state. Changing this flag requires service and TUI restart.',
+      ),
     presets: z.record(z.string(), PresetSchema).optional(),
     agents: z.record(z.string(), AgentOverrideConfigSchema).optional(),
     disabled_agents: z

@@ -7636,6 +7636,85 @@ describe('ForegroundFallbackManager chain generation pins', () => {
     });
   });
 
+  test('explicit conversation capture replaces an early global pin', async () => {
+    createMockClient();
+    const manager = makeGenerationManager({
+      orchestrator: ['global/primary', 'global/backup'],
+    });
+    const switchModel = mock(async () => {});
+    manager.registerSessionAgent('conversation-child', 'orchestrator');
+    manager.pinSessionChains('conversation-child', {
+      orchestrator: [
+        { id: 'snapshot/primary' },
+        { id: 'snapshot/backup', variant: 'deep' },
+      ],
+    });
+    await manager.handleV2Retry(
+      {
+        sessionID: 'conversation-child',
+        agent: 'orchestrator',
+        model: { providerID: 'snapshot', id: 'primary' },
+        error: { message: 'Rate limit exceeded' },
+        decision: { retry: true },
+      },
+      switchModel,
+    );
+    expect(switchModel).toHaveBeenCalledWith('conversation-child', {
+      providerID: 'snapshot',
+      id: 'backup',
+      variant: 'deep',
+    });
+  });
+
+  test('dispatch binding does not replace an existing root running chain', async () => {
+    createMockClient();
+    const manager = makeGenerationManager({
+      orchestrator: ['original/primary', 'original/backup'],
+    });
+    const switchModel = mock(async () => {});
+    manager.registerSessionAgent('bound-root', 'orchestrator');
+    manager.pinSessionChains(
+      'bound-root',
+      { orchestrator: [{ id: 'alternate/primary' }] },
+      false,
+    );
+    await manager.handleV2Retry(
+      {
+        sessionID: 'bound-root',
+        agent: 'orchestrator',
+        model: { providerID: 'original', id: 'primary' },
+        error: { message: 'Rate limit exceeded' },
+        decision: { retry: true },
+      },
+      switchModel,
+    );
+    expect(switchModel).toHaveBeenCalledWith('bound-root', {
+      providerID: 'original',
+      id: 'backup',
+    });
+  });
+
+  test('an empty captured table never falls through to global chains', async () => {
+    createMockClient();
+    const manager = makeGenerationManager({
+      orchestrator: ['global/primary', 'global/backup'],
+    });
+    const switchModel = mock(async () => {});
+    manager.registerSessionAgent('empty-snapshot-child', 'orchestrator');
+    manager.pinSessionChains('empty-snapshot-child', {});
+    await manager.handleV2Retry(
+      {
+        sessionID: 'empty-snapshot-child',
+        agent: 'orchestrator',
+        model: { providerID: 'global', id: 'primary' },
+        error: { message: 'Rate limit exceeded' },
+        decision: { retry: true },
+      },
+      switchModel,
+    );
+    expect(switchModel).not.toHaveBeenCalled();
+  });
+
   test('releaseSessionChains lets a retry pin the current generation', async () => {
     createMockClient();
     const chains: Record<

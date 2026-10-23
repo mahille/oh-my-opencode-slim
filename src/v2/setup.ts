@@ -41,9 +41,10 @@ import { GOAL_POINTER_METADATA_KEY } from '../hooks/deepwork-goal';
 import type { ForegroundFallbackManager } from '../hooks/foreground-fallback';
 import { PHASE_REMINDER_METADATA_KEY } from '../hooks/phase-reminder';
 import { BACKGROUND_JOB_BOARD_METADATA_KEY } from '../hooks/task-session-manager/board-injection';
-import { OhMyOpenCodeLite } from '../index';
+import { OhMyOpenCodeLite, type V2ProfileRefreshResult } from '../index';
 import { loadMergedOpenCodeConfig } from '../marketplace/preflight';
 import type { McpConfig } from '../mcp/types';
+import { recordSessionAgentModels } from '../tui-state';
 import {
   configureBackgroundJobPersistence,
   loadInitialBackgroundJobPersistence,
@@ -89,12 +90,17 @@ import {
   createSessionProfileBridge,
   reconcileRuntimeProfileOptionKeys,
   type V2AgentRuntimeProfiles,
+  type V2RuntimeChains,
 } from './runtime-profiles';
 import {
   createSessionSubmit,
   userTextFromContent,
   type V2CommandSubmit,
 } from './session-submit';
+import {
+  readTuiAttachMarkersForSession,
+  watchTuiAttachMarkers,
+} from './tui-attach';
 import type {
   V2AgentDraft,
   V2Cleanup,
@@ -2445,19 +2451,25 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       // resolves ONLY model/variant/temperature/options per agent, atomically
       // swapped here and projected to the sidebar through the existing
       // tui-state writer. Failure is honest: no swap, one logged cause.
+      // Global defaults refresh in both modes; root ownership is opt-in and
+      // frozen at startup, matching the TUI's feature gate.
       let currentProfiles: V2AgentRuntimeProfiles = {};
+      let currentChains: V2RuntimeChains = {};
       let registeredProfiles: V2AgentRuntimeProfiles = {};
+      const sessionModelStateEnabled = pluginConfig.sessionModelState === true;
       try {
         const factoryRefreshProfiles = (
           v1Hooks as { 'v2.refreshProfiles'?: unknown }
         )['v2.refreshProfiles'];
         if (typeof factoryRefreshProfiles === 'function') {
-          const refreshProfiles = factoryRefreshProfiles as (options?: {
+          const refreshProfiles = async (options?: {
             allowInvalidFallback?: boolean;
-          }) => Promise<
-            | { ok: true; profiles: V2AgentRuntimeProfiles }
-            | { ok: false; reason: string }
-          >;
+          }): Promise<V2ProfileRefreshResult> => {
+            const result: V2ProfileRefreshResult =
+              await factoryRefreshProfiles(options);
+            if (result.ok) currentChains = result.chains ?? {};
+            return result;
+          };
           // Startup has no last-good table. Seed from the loader's normal
           // fallback config so malformed input stays non-fatal, then make all
           // later watcher refreshes strict and retain this seed on failure.
@@ -2704,29 +2716,123 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       // asynchronous event pump), while `observeEvent` remains a
       // prewarm/cleanup consumer of `session.created`/`session.deleted`.
       let promptBridge: V2SessionPromptBridge | undefined;
-      // Chain-generation parity: pin the fallback chains when the child's
-      // profile freezes, so one registration = one generation for both.
-      // A failed admission releases the pin so the retry pairs a fresh
-      // capture with the generation current at that retry.
+      // Pin the inherited conversation chain table before the child's first
+      // switch. A failed admission releases only its running-chain pin.
       // `v2.pinSessionChains` / `v2.releaseSessionChains` are factory
       // extension hooks, not in Hooks.
       const pinSessionChainsHook = v1Hooks as {
-        'v2.pinSessionChains'?: (sessionID: string) => void;
+        'v2.pinSessionChains'?: (
+          sessionID: string,
+          chains?: NonNullable<
+            Extract<V2ProfileRefreshResult, { ok: true }>['chains']
+          >,
+        ) => void;
+        'v2.setSessionDispatchChains'?: (
+          sessionID: string,
+          chains: NonNullable<
+            Extract<V2ProfileRefreshResult, { ok: true }>['chains']
+          >,
+        ) => void;
         'v2.releaseSessionChains'?: (sessionID: string) => void;
       };
+      const resolveFreshProfiles = (
+        v1Hooks as {
+          'v2.resolveProfiles'?: (options?: {
+            config?:
+              | import('../config/schema').PluginConfig
+              | ReturnType<typeof loadPluginConfig>;
+          }) => Promise<V2ProfileRefreshResult>;
+        }
+      )['v2.resolveProfiles'];
       const sessionProfileBridge = createSessionProfileBridge({
+        sessionModelState: sessionModelStateEnabled,
         profiles: () => currentProfiles,
+        chains: () => currentChains,
+        snapshots: new Map(),
+        resolveFreshProfiles: resolveFreshProfiles
+          ? async (options) => {
+              const result = await resolveFreshProfiles(options);
+              if (!result.ok) return result;
+              return {
+                ok: true,
+                profiles: reconcileRuntimeProfileOptionKeys(
+                  registeredProfiles,
+                  result.profiles,
+                ),
+                projection: result.projection,
+                chains: result.chains,
+              };
+            }
+          : undefined,
         registeredProfiles,
         pluginAgents,
         session: ctx.session,
         knownAgent: (sessionID) => promptBridge?.agentForSession(sessionID),
-        onSessionCaptured: (sessionID) => {
-          pinSessionChainsHook['v2.pinSessionChains']?.(sessionID);
+        beforeSessionCapture: async (sessionID) => {
+          await consumeSessionMarkers(sessionID);
+        },
+        onSessionCaptured: (sessionID, chains) => {
+          pinSessionChainsHook['v2.pinSessionChains']?.(sessionID, chains);
         },
         onSessionCaptureFailed: (sessionID) => {
           pinSessionChainsHook['v2.releaseSessionChains']?.(sessionID);
         },
+        onDispatchSnapshotBound: (sessionID, chains) => {
+          pinSessionChainsHook['v2.setSessionDispatchChains']?.(
+            sessionID,
+            chains,
+          );
+        },
+        onRootSnapshot: (sessionID, projection) => {
+          // Persist the per-conversation sidebar projection best-effort: a
+          // tui-state write failure must never break the prompt path.
+          try {
+            recordSessionAgentModels(directory, sessionID, projection);
+          } catch (error) {
+            log('[v2] failed to record session agent models', String(error));
+          }
+        },
       });
+
+      async function consumeSessionMarkers(sessionID: string): Promise<void> {
+        if (!sessionModelStateEnabled) return;
+        for (const marker of readTuiAttachMarkersForSession(
+          directory,
+          sessionID,
+        )) {
+          // Legacy attach hints may initialize once, but never implicitly switch
+          // a bound conversation. New markers carry the effective config bytes.
+          await sessionProfileBridge.refreshRootSnapshot(sessionID, {
+            config: marker.config,
+            kind: marker.kind ?? 'initialize',
+            operationID: JSON.stringify([
+              marker.sessionID,
+              marker.tuiBootID,
+              marker.timestamp,
+              marker.revision,
+              marker.kind,
+            ]),
+          });
+        }
+      }
+
+      // ── TUI attach marker watcher (opt-in only) ──
+      // A TUI that STARTS viewing a conversation (boot via `opencode -s`,
+      // or navigation to another conversation) drops a marker into the
+      // project's attach dir. Initialization binds only an unbound root;
+      // switches replace only their target's future-child snapshot. Marker
+      // snapshots are authoritative, never hints to reread shared disk.
+      if (sessionModelStateEnabled) {
+        try {
+          const attachWatch = watchTuiAttachMarkers({
+            directory,
+            onAttach: (sessionID) => consumeSessionMarkers(sessionID),
+          });
+          disposers.push(() => attachWatch.dispose());
+        } catch (err) {
+          log('[v2] tui-attach watcher registration failed', String(err));
+        }
+      }
 
       // Skip session hook registration if ctx.session is unavailable (v1 host
       // embedded v2 core with limited context). On full v2 contexts, session
@@ -2771,6 +2877,8 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
             }
             // Freeze and switch the inference profile before the admitted
             // input's first model request; the event stream is only a prewarm.
+            await consumeSessionMarkers(event.sessionID);
+            await sessionProfileBridge.refreshRootSnapshot(event.sessionID);
             await sessionProfileBridge.ensureSessionProfile(event.sessionID);
             await bridge.handlePrompt(event);
           });

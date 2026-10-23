@@ -17,7 +17,19 @@
  * Existing/resumed child sessions keep the profile captured when they were
  * first seen; parents and foreign-agent sessions are never touched.
  */
+import type { PluginConfig, ResolvedPluginConfig } from '../config/schema';
 import type { V2Context, V2SessionContextEvent } from './types';
+
+export type V2RuntimeChains = Record<
+  string,
+  { id: string; variant?: string }[]
+>;
+
+export interface RootSnapshotOperation {
+  config?: PluginConfig | ResolvedPluginConfig;
+  kind?: 'initialize' | 'switch';
+  operationID?: string;
+}
 
 /** One agent's hot-applicable inference fields + sidebar projection. */
 export interface V2AgentRuntimeProfile {
@@ -35,9 +47,10 @@ export interface V2AgentRuntimeProfile {
 export type V2AgentRuntimeProfiles = Record<string, V2AgentRuntimeProfile>;
 
 /** Per-session frozen profile (`null` = frozen with no applicable profile). */
-type FrozenProfile = V2AgentRuntimeProfile | null;
+export type FrozenProfile = V2AgentRuntimeProfile | null;
 
-/** Cap on per-session bookkeeping (FIFO eviction, mirrors the other v2 maps). */
+/** Cap on auxiliary classification/tombstone bookkeeping only. Authoritative
+ * dispatch bindings and captured profiles remain until session deletion. */
 const MAX_PROFILE_SESSIONS = 1024;
 const PROFILE_OPERATION_TIMEOUT_MS = 2_000;
 /** Bound for the request-path model switch. Rejecting (not proceeding) is
@@ -93,8 +106,29 @@ export function resolveV2EventPayload(
 }
 
 export interface SessionProfileBridgeOptions {
+  /** Startup-frozen opt-in to root bindings and inherited dispatch snapshots. */
+  sessionModelState?: boolean;
   /** Current profile table (read on every newly seen child). */
   profiles: () => V2AgentRuntimeProfiles;
+  chains?: () => V2RuntimeChains;
+  /** Authoritative dispatch bindings, retained until session deletion. */
+  snapshots?: Map<string, Record<string, FrozenProfile>>;
+  resolveFreshProfiles?: (options?: {
+    config?: PluginConfig | ResolvedPluginConfig;
+  }) => Promise<
+    | {
+        ok: true;
+        profiles: V2AgentRuntimeProfiles;
+        chains?: V2RuntimeChains;
+        /** The resolver's sidebar projection for the same table. */
+        projection: {
+          agentModels: Record<string, string>;
+          agentVariants: Record<string, string>;
+          preset?: string;
+        };
+      }
+    | { ok: false; reason: string }
+  >;
   /** Startup profiles, matching the host-registered agent defaults. */
   registeredProfiles?: V2AgentRuntimeProfiles;
   /** Plugin-defined agent ids; foreign children are never profiled. */
@@ -106,15 +140,29 @@ export interface SessionProfileBridgeOptions {
   knownAgent?: (sessionID: string) => string | undefined;
   /** Observability/log seam (tests inject; defaults to no logging). */
   log?: (message: string, meta?: unknown) => void;
-  /** Fired when a plugin child's profile is frozen (the registration
-   *  moment). The factory pins the fallback-chain generation here so the
-   *  session's chain snapshot comes from the same generation as its frozen
-   *  profile — a refresh between registration and the first failure cannot
-   *  mix generations for one child. */
-  onSessionCaptured?: (sessionID: string) => void;
+  /** Pin the child's inherited chain table before its first model switch. */
+  onSessionCaptured?: (sessionID: string, chains?: V2RuntimeChains) => void;
+  beforeSessionCapture?: (parentSessionID: string) => Promise<void>;
   /** A capture attempt failed (switch rejected or timed out) and the
    *  admission aborted — release anything pinned by the failed attempt. */
   onSessionCaptureFailed?: (sessionID: string) => void;
+  onDispatchSnapshotBound?: (
+    sessionID: string,
+    chains: V2RuntimeChains,
+  ) => void;
+  /** Fired after a root's snapshot was stored from a successful (ok)
+   *  refresh, with the resolver's sidebar projection for the new table.
+   *  The existing guards already restrict this to plugin roots on a
+   *  fresh resolution; a failed (ok: false) resolution never fires it. */
+  onRootSnapshot?: (
+    sessionID: string,
+    projection: {
+      agentModels: Record<string, string>;
+      agentVariants: Record<string, string>;
+      preset?: string;
+    },
+    chains?: V2RuntimeChains,
+  ) => void;
   /** Test seam: override the request-path model-switch bound. */
   switchTimeoutMs?: number;
 }
@@ -132,6 +180,11 @@ export interface SessionProfileIdentity {
 }
 
 export interface SessionProfileBridge {
+  /** Bind once, or explicitly switch only this root's future-child snapshot. */
+  refreshRootSnapshot(
+    sessionID: string,
+    operation?: RootSnapshotOperation,
+  ): Promise<void>;
   /** Observe one raw v2 event (prewarm/cleanup path); never throws. */
   observeEvent(event: Record<string, unknown>): Promise<void>;
   /**
@@ -149,7 +202,7 @@ export interface SessionProfileBridge {
   ): Promise<void>;
   /** Frozen profile for a session (undefined when not captured). */
   profileForSession(sessionID: string): V2AgentRuntimeProfile | undefined;
-  /** Captured session count (bounded; test seam). */
+  /** Captured session count (retained until deletion; test seam). */
   size(): number;
 }
 
@@ -173,6 +226,12 @@ export function createSessionProfileBridge(
   options: SessionProfileBridgeOptions,
 ): SessionProfileBridge {
   const captured = new Map<string, FrozenProfile>();
+  const snapshots =
+    options.snapshots ?? new Map<string, Record<string, FrozenProfile>>();
+  const roots = new Map<string, boolean>();
+  const snapshotChains = new Map<string, V2RuntimeChains>();
+  const rootOperations = new Map<string, Promise<void>>();
+  const appliedOperations = new Set<string>();
   /** Sessions proven to never qualify (root / foreign / non-plugin agent). */
   const ignored = new Set<string>();
   /** Deleted ids stay inert until a fresh session.created proves reuse. */
@@ -182,10 +241,14 @@ export function createSessionProfileBridge(
   const emitLog = options.log ?? (() => {});
 
   function prune(): void {
-    while (captured.size > MAX_PROFILE_SESSIONS) {
-      const oldest = captured.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      captured.delete(oldest);
+    // Dispatch bindings and captured children are authoritative until deletion.
+    // Evicting them would silently rebind a live conversation to shared disk.
+    for (const map of [roots]) {
+      while (map.size > MAX_PROFILE_SESSIONS) {
+        const oldest = map.keys().next().value;
+        if (oldest === undefined) break;
+        map.delete(oldest);
+      }
     }
     while (ignored.size > MAX_PROFILE_SESSIONS) {
       const oldest = ignored.values().next().value as string | undefined;
@@ -251,6 +314,13 @@ export function createSessionProfileBridge(
     if (!agent) {
       agent = cleanID(options.knownAgent?.(sessionID));
     }
+    if (authoritative && (parentID || agent)) {
+      roots.set(
+        sessionID,
+        !parentID && !!agent && options.pluginAgents.has(agent),
+      );
+      prune();
+    }
     return {
       ...(parentID ? { parentID } : {}),
       ...(agent ? { agent } : {}),
@@ -277,6 +347,8 @@ export function createSessionProfileBridge(
     }
     const task = (async () => {
       const resolved = await resolveIdentity(sessionID, identity);
+      // Corrupt/reduced identity adapters must not create a self-await cycle.
+      if (resolved.parentID === sessionID) return;
       if (!resolved.parentID) {
         if (resolved.authoritative) {
           // Proven root session: never profile it.
@@ -300,7 +372,24 @@ export function createSessionProfileBridge(
         return;
       }
 
-      const profile = options.profiles()[resolved.agent];
+      if (options.sessionModelState) {
+        await options.beforeSessionCapture?.(resolved.parentID);
+        await ensure(resolved.parentID);
+        await refreshRootSnapshot(resolved.parentID);
+      }
+      const table =
+        (options.sessionModelState && snapshots.get(resolved.parentID)) ||
+        options.profiles();
+      // Preserve the complete dispatch snapshot for grandchildren, including
+      // absent/null entries: a pinned omission must never consult globals.
+      if (options.sessionModelState) snapshots.set(sessionID, table);
+      const chains = options.sessionModelState
+        ? (snapshotChains.get(resolved.parentID) ??
+          (snapshots.has(resolved.parentID) ? {} : options.chains?.()))
+        : options.chains?.();
+      if (options.sessionModelState && chains)
+        snapshotChains.set(sessionID, chains);
+      const profile = table[resolved.agent];
       if (!profile) {
         // Plugin-managed but absent from the profile table (e.g. a
         // marketplace-agent child: the registry registers it yet the table
@@ -308,7 +397,7 @@ export function createSessionProfileBridge(
         // Freeze null so admission proceeds on the host-registered model
         // with no temperature/options applied — never reject the prompt hook.
         captured.set(sessionID, null);
-        options.onSessionCaptured?.(sessionID);
+        options.onSessionCaptured?.(sessionID, chains);
         prune();
         emitLog('[v2][profile] child session captured without a profile', {
           sessionID,
@@ -325,7 +414,7 @@ export function createSessionProfileBridge(
       ) {
         // Nothing to switch, or the host already runs a per-call model.
         captured.set(sessionID, profile);
-        options.onSessionCaptured?.(sessionID);
+        options.onSessionCaptured?.(sessionID, chains);
         prune();
         emitLog('[v2][profile] child session captured without a model switch', {
           sessionID,
@@ -334,18 +423,19 @@ export function createSessionProfileBridge(
         return;
       }
       const switchModel = options.session?.switchModel;
-      if (typeof switchModel !== 'function') {
-        throw new Error('session.switchModel unavailable for runtime profile');
-      }
-      // Pin the chain generation at profile-capture time — before the
-      // awaited switch — so a refresh landing mid-switch cannot pair the
-      // old profile with a newer chain generation.
-      options.onSessionCaptured?.(sessionID);
       // Bounded and fail-closed: this rejection propagates to the prompt hook
       // and aborts the admission BEFORE any request can run on the wrong
       // model. The host call cannot be cancelled, but a late switch can only
       // affect a later retry, which re-awaits the same idempotent call.
       try {
+        if (typeof switchModel !== 'function') {
+          throw new Error(
+            'session.switchModel unavailable for runtime profile',
+          );
+        }
+        // Pin the inherited chain table before the awaited switch, so a root
+        // switch landing mid-admission cannot change this child's generation.
+        options.onSessionCaptured?.(sessionID, chains);
         await withProfileTimeout(
           switchModel.call(options.session, {
             sessionID,
@@ -355,9 +445,10 @@ export function createSessionProfileBridge(
           options.switchTimeoutMs ?? PROFILE_SWITCH_TIMEOUT_MS,
         );
       } catch (err) {
-        // Aborted admission: no request ran, so releasing the capture-time
-        // pin lets the retry pair a fresh capture with the generation
-        // current at that retry instead of keeping this attempt's pin.
+        // Aborted admission: no request ran. Discard both dispatch and running
+        // state, so a retry inherits its parent's then-current snapshot.
+        snapshots.delete(sessionID);
+        snapshotChains.delete(sessionID);
         options.onSessionCaptureFailed?.(sessionID);
         throw err;
       }
@@ -377,7 +468,84 @@ export function createSessionProfileBridge(
     }
   }
 
+  async function refreshRootSnapshot(
+    sessionID: string,
+    operation?: RootSnapshotOperation,
+  ): Promise<void> {
+    if (!options.sessionModelState) return;
+    const previous = rootOperations.get(sessionID) ?? Promise.resolve();
+    const task = previous
+      .catch(() => {})
+      .then(async () => {
+        if (
+          operation?.operationID &&
+          appliedOperations.has(operation.operationID)
+        ) {
+          return;
+        }
+        if (snapshots.has(sessionID) && operation?.kind !== 'switch') return;
+        if (
+          !sessionID ||
+          deleted.has(sessionID) ||
+          captured.has(sessionID) ||
+          roots.get(sessionID) === false ||
+          !options.resolveFreshProfiles
+        ) {
+          return;
+        }
+        if (!roots.has(sessionID)) {
+          const identity = await resolveIdentity(sessionID, undefined);
+          if (!identity.authoritative || identity.parentID) return;
+          if (!identity.agent || !options.pluginAgents.has(identity.agent)) {
+            // Known foreign roots must not gain a plugin snapshot on later turns.
+            roots.set(sessionID, false);
+            prune();
+            return;
+          }
+        }
+        const resolved = await options.resolveFreshProfiles(
+          operation?.config ? { config: operation.config } : undefined,
+        );
+        if (
+          !resolved.ok &&
+          !operation?.config &&
+          !deleted.has(sessionID) &&
+          !snapshots.has(sessionID)
+        ) {
+          // An invalid shared file cannot leave an admitted root unbound: pin
+          // the global last-good defaults once, rather than letting a later
+          // unrelated conversation's disk write silently choose this root.
+          snapshots.set(sessionID, options.profiles());
+          const chains = options.chains?.() ?? {};
+          snapshotChains.set(sessionID, chains);
+          options.onDispatchSnapshotBound?.(sessionID, chains);
+        }
+        if (resolved.ok && !deleted.has(sessionID)) {
+          snapshots.set(sessionID, resolved.profiles);
+          snapshotChains.set(sessionID, resolved.chains ?? {});
+          options.onDispatchSnapshotBound?.(sessionID, resolved.chains ?? {});
+          if (operation?.operationID)
+            appliedOperations.add(operation.operationID);
+          prune();
+          options.onRootSnapshot?.(
+            sessionID,
+            resolved.projection,
+            resolved.chains,
+          );
+        }
+      });
+    rootOperations.set(sessionID, task);
+    try {
+      await task;
+    } finally {
+      if (rootOperations.get(sessionID) === task)
+        rootOperations.delete(sessionID);
+    }
+  }
+
   return {
+    refreshRootSnapshot,
+
     async observeEvent(event) {
       try {
         if (!isRecord(event)) return;
@@ -386,6 +554,9 @@ export function createSessionProfileBridge(
           const deletedID = payload.sessionID ?? payload.id;
           if (typeof deletedID === 'string' && deletedID) {
             captured.delete(deletedID);
+            snapshots.delete(deletedID);
+            snapshotChains.delete(deletedID);
+            roots.delete(deletedID);
             ignored.delete(deletedID);
             deleted.add(deletedID);
             prune();

@@ -14,7 +14,11 @@ import {
   SUBAGENT_NAMES,
 } from './config/constants';
 import { loadPluginConfig } from './config/loader';
-import { MultiplexerConfigSchema, type MultiplexerType } from './config/schema';
+import {
+  MultiplexerConfigSchema,
+  type MultiplexerType,
+  type PluginConfig,
+} from './config/schema';
 import {
   createOnceGate,
   logHostUnsupported,
@@ -42,6 +46,7 @@ import {
   resolveTuiSnapshotRoot,
   snapshotSectionsEqual,
   type TuiSnapshot,
+  writeTuiAttachMarker,
 } from './tui-state';
 import { isPluginDisabledByEnv } from './utils/env';
 import { log } from './utils/logger';
@@ -171,7 +176,8 @@ export type TuiRouteView =
       sessionID?: string;
     };
 
-export function resolveRouteSessionId(route: TuiRouteView): string | undefined {
+export function resolveRouteSessionId(route: unknown): string | undefined {
+  if (!route || typeof route !== 'object') return undefined;
   const view = route as {
     name?: string;
     params?: { sessionID?: unknown };
@@ -250,8 +256,46 @@ export function splitSidebarModelId(model: string): {
   };
 }
 
-export function getSidebarAgentNames(snapshot: TuiSnapshot): string[] {
-  const configuredAgents = Object.keys(snapshot.agentModels);
+/**
+ * Agent projection the sidebar rows display for the visible conversation:
+ * when that conversation's root carries a recorded per-session projection
+ * (a v2 conversation snapshot), it is authoritative, including absent
+ * models and variants. Without a visible session — or when
+ * the record is missing (incl. v1 hosts, which never write records) — the
+ * global projection is returned unchanged.
+ */
+export function sidebarAgentProjection(
+  snapshot: TuiSnapshot,
+  visibleSessionID?: string,
+): {
+  agentModels: Record<string, string>;
+  agentVariants: Record<string, string>;
+} {
+  const root =
+    visibleSessionID === undefined
+      ? undefined
+      : resolveTuiSnapshotRoot(snapshot, visibleSessionID);
+  const record =
+    root === undefined ? undefined : snapshot.sessionAgentModels?.[root];
+  if (record === undefined) {
+    return {
+      agentModels: snapshot.agentModels,
+      agentVariants: snapshot.agentVariants,
+    };
+  }
+  return {
+    agentModels: record.agentModels,
+    agentVariants: record.agentVariants,
+  };
+}
+
+export function getSidebarAgentNames(
+  snapshot: TuiSnapshot,
+  visibleSessionID?: string,
+): string[] {
+  const configuredAgents = Object.keys(
+    sidebarAgentProjection(snapshot, visibleSessionID).agentModels,
+  );
   return configuredAgents.length > 0
     ? configuredAgents
     : FALLBACK_SIDEBAR_AGENTS;
@@ -1431,6 +1475,10 @@ export function renderSidebar(
       )
     : null;
   const activeAgents = getActiveSidebarAgentNames(snapshot, visibleRootID);
+  // Model/variant rows follow the visible conversation's recorded snapshot
+  // when it has one; the fallback chain (global, then 'pending') below keeps
+  // the v1 path (no records) on the global rows.
+  const projection = sidebarAgentProjection(snapshot, visibleRootID);
   const targetsByAgent = new Map(
     getSidebarAgentTargets(snapshot, visibleRootID).map((group) => [
       group.agentName,
@@ -1493,9 +1541,9 @@ export function renderSidebar(
       header,
       ...(sidebarOpen ? [configStatusRow, presetRowEl] : []),
       ...(sidebarOpen
-        ? getSidebarAgentNames(snapshot).flatMap((agentName) => {
-            const model = snapshot.agentModels[agentName] ?? 'pending';
-            const variant = snapshot.agentVariants[agentName];
+        ? getSidebarAgentNames(snapshot, visibleRootID).flatMap((agentName) => {
+            const model = projection.agentModels[agentName] ?? 'pending';
+            const variant = projection.agentVariants[agentName];
             const active = activeAgents.has(agentName);
             const sessions = targetsByAgent.get(agentName) ?? [];
             const reusable = reusableByAgent.get(agentName) ?? [];
@@ -1820,6 +1868,8 @@ function v2ThemeView(theme: V2TuiThemeTokens): {
 }
 
 interface SidebarRuntimeAdapter {
+  presetOwner?: object;
+  initialConfig?: PluginConfig | null;
   hostFlavor?: string;
   version: string;
   getDirectory: () => string;
@@ -1840,9 +1890,121 @@ interface SidebarRuntimeAdapter {
   onMultiplexerConfig?: (type: MultiplexerType) => void;
 }
 
+const tuiPresetDefaults = new WeakMap<
+  object,
+  Map<string, PluginConfig | null>
+>();
+const tuiSessionModelState = new WeakMap<object, boolean>();
+
+/** Freeze feature admission per TUI owner, never from a later disk edit. */
+export function tuiSessionModelStateEnabled(
+  owner: object,
+  directory: string,
+  initialConfig?: PluginConfig | null,
+): boolean {
+  let enabled = tuiSessionModelState.get(owner);
+  if (enabled === undefined) {
+    const config =
+      initialConfig === undefined
+        ? loadTuiPresetConfig(directory)
+        : initialConfig;
+    enabled = config?.sessionModelState === true;
+    tuiSessionModelState.set(owner, enabled);
+  }
+  return enabled;
+}
+
+/** Loader fallback values are not a valid replacement for a captured config. */
+function loadTuiPresetConfig(
+  directory: string,
+  presetOverride?: string,
+): PluginConfig | null {
+  let invalid = false;
+  const config = loadPluginConfig(directory, {
+    silent: true,
+    hostFlavor: 'v2',
+    presetOverride,
+    onWarning: (diagnostic) => {
+      if (
+        ['invalid-json', 'invalid-schema', 'read-error'].includes(
+          diagnostic.kind,
+        )
+      )
+        invalid = true;
+    },
+  });
+  return invalid ? null : config;
+}
+
+/** Enabled publication precedes any await; disabled binding is a success/no-op. */
+export function publishTuiPresetSwitch(
+  owner: object,
+  directory: string,
+  presetName: string,
+  targetSessionID?: string,
+): { ok: boolean; reason?: string } {
+  if (!tuiSessionModelStateEnabled(owner, directory)) return { ok: true };
+  const config = loadTuiPresetConfig(directory, presetName);
+  if (!config) return { ok: false, reason: 'Invalid preset configuration' };
+  if (
+    targetSessionID &&
+    !writeTuiAttachMarker(directory, targetSessionID, {
+      kind: 'switch',
+      config,
+    })
+  )
+    return { ok: false, reason: 'Failed to publish conversation preset' };
+  tuiPresetDefaults.get(owner)?.set(directory, structuredClone(config));
+  return { ok: true };
+}
+
 /** One refresh/animation/interaction lifecycle for both host slot contracts. */
 function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
   let configDirectory = adapter.getDirectory();
+  const startupDirectory = configDirectory;
+  const defaults = new Map<string, PluginConfig | null>();
+  const initialConfig = (directory: string): PluginConfig | null => {
+    let config = defaults.get(directory);
+    if (config === undefined) {
+      config = structuredClone(
+        directory === startupDirectory && adapter.initialConfig !== undefined
+          ? adapter.initialConfig
+          : adapter.hostFlavor === 'v2'
+            ? loadTuiPresetConfig(directory)
+            : loadPluginConfig(directory, {
+                silent: true,
+                hostFlavor: adapter.hostFlavor,
+              }),
+      );
+      defaults.set(directory, config);
+    }
+    return config;
+  };
+  const startupConfig = initialConfig(configDirectory);
+  const sessionModelState =
+    adapter.hostFlavor === 'v2' &&
+    tuiSessionModelStateEnabled(
+      adapter.presetOwner ?? adapter,
+      configDirectory,
+      startupConfig,
+    );
+  if (adapter.presetOwner) tuiPresetDefaults.set(adapter.presetOwner, defaults);
+  const initializeSession = (sessionID: string): void => {
+    if (adapter.hostFlavor === 'v2' && !sessionModelState) return;
+    const config = initialConfig(configDirectory);
+    if (adapter.hostFlavor === 'v2' && !config) return;
+    const target =
+      adapter.hostFlavor === 'v2'
+        ? resolveTuiSnapshotRoot(readTuiSnapshot(configDirectory), sessionID)
+        : sessionID;
+    writeTuiAttachMarker(
+      configDirectory,
+      target,
+      adapter.hostFlavor === 'v2'
+        ? { kind: 'initialize', config: config ?? undefined }
+        : undefined,
+    );
+  };
   let { configInvalid, compactSidebar, multiplexerType, presetName } =
     readConfigState(configDirectory, adapter.hostFlavor);
   adapter.onMultiplexerConfig?.(multiplexerType);
@@ -1868,9 +2030,33 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
   const [snapshot, setSnapshot] = createSignal(
     readTuiSnapshot(configDirectory),
   );
+  // The route is not a reactive dependency of the render slot, so a
+  // navigation alone would never re-render the sidebar. The poll (below)
+  // and the interaction's navigate wrapper keep this signal current; the
+  // slot reads it so per-conversation rows (visible session's model
+  // projection) follow navigation without waiting for a state write.
+  const [visibleSession, setVisibleSession] = createSignal<string | undefined>(
+    adapter.getVisibleSession(),
+  );
   const [animationNow, setAnimationNow] = createSignal(Date.now());
   let disposed = false;
   let unregisterConfigListener = () => {};
+  // Navigation offers this TUI's captured default only to unbound roots.
+  // It never rereads the shared active preset and never repins an existing root.
+  const noteVisibleSession = (visible: string | undefined): boolean => {
+    if (visible === visibleSession() || disposed) return false;
+    setVisibleSession(visible);
+    if (visible !== undefined) {
+      initializeSession(visible);
+    }
+    return true;
+  };
+  // First resolution: the route is usually already resolved before the
+  // runtime is constructed (TUI boot attached to a session).
+  const initialVisibleSession = visibleSession();
+  if (initialVisibleSession !== undefined) {
+    initializeSession(initialVisibleSession);
+  }
   const remoteCache: RemoteModelCache = {};
   const modelNamesCache: ModelNamesCache = { names: new Map() };
   const [modelNames, setModelNames] = createSignal<ReadonlyMap<string, string>>(
@@ -1902,6 +2088,12 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
         log('[v2][tui] config state read failed', String(err));
       }
     }
+    // Navigation re-scopes the visible conversation (its model rows follow
+    // that conversation's recorded snapshot), so a route change must
+    // re-render even when the snapshot file did not change.
+    if (noteVisibleSession(adapter.getVisibleSession())) {
+      stateChanged = true;
+    }
     nextSnapshot = await hydrateRemoteModels(
       nextSnapshot,
       adapter.client,
@@ -1927,8 +2119,20 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
     }
     if (!disposed) adapter.renderer.requestRender();
   };
+  // Click-driven navigation updates the route; nudge the visible-session
+  // signal immediately so the per-conversation rows do not wait for the
+  // next 1 s poll (a host that updates the route asynchronously is picked
+  // up by the poll anyway).
+  const navigate = adapter.navigate
+    ? (sessionID: string): void => {
+        adapter.navigate?.(sessionID);
+        if (noteVisibleSession(adapter.getVisibleSession())) {
+          adapter.renderer.requestRender();
+        }
+      }
+    : undefined;
   const interaction = createSidebarInteraction(
-    adapter.navigate,
+    navigate,
     selectionGuard(adapter.renderer),
   );
   const scheduleRefresh = createSerializedRefresh(refreshSidebar);
@@ -1973,8 +2177,24 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
 
   const disposeSlot = adapter.registerSlot(() =>
     reactiveElement(() => {
-      const visible = adapter.getVisibleSession();
-      const currentSnapshot = snapshot();
+      const visible = visibleSession();
+      const currentSnapshot =
+        adapter.hostFlavor === 'v2' && !sessionModelState
+          ? { ...snapshot(), sessionAgentModels: {} }
+          : snapshot();
+      const pinned =
+        visible === undefined
+          ? undefined
+          : currentSnapshot.sessionAgentModels[
+              resolveTuiSnapshotRoot(currentSnapshot, visible)
+            ];
+      // Undefined is meaningful: an unconfigured local/pinned preset must not
+      // inherit another TUI's shared-disk selection on a later poll.
+      const displayedPreset = sessionModelState
+        ? pinned === undefined
+          ? defaults.get(configDirectory)?.preset
+          : pinned.preset
+        : presetName;
       interaction.syncScope(
         configDirectory,
         visible === undefined
@@ -1990,7 +2210,7 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
         animationNow,
         visible,
         interaction,
-        adapter.getPresetRow?.(configDirectory, presetName),
+        adapter.getPresetRow?.(configDirectory, displayedPreset),
         modelNames(),
       );
     }),
@@ -2004,6 +2224,7 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
       if (disposed) return;
       disposed = true;
       unregisterConfigListener();
+      if (adapter.presetOwner) tuiPresetDefaults.delete(adapter.presetOwner);
       disposeSlot?.();
       clearInterval(renderTimer);
       clearInterval(animationTimer);
@@ -2014,10 +2235,33 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
 /** V2 slot adapter; `/preset` remains registered by src/v2/tui.ts. */
 async function setup(ctx: V2TuiContext): Promise<undefined | (() => void)> {
   if (isPluginDisabledByEnv()) return;
+  const initialConfig = loadTuiPresetConfig(
+    ctx.location?.directory ?? process.cwd(),
+  );
+  tuiSessionModelStateEnabled(
+    ctx,
+    ctx.location?.directory ?? process.cwd(),
+    initialConfig,
+  );
   const presetManagerCtx = (directory: string): V2TuiContext => {
+    const visible = resolveRouteSessionId(ctx.ui.router.current());
+    const target =
+      visible === undefined
+        ? undefined
+        : resolveTuiSnapshotRoot(readTuiSnapshot(directory), visible);
     const augmented = Object.create(ctx as object) as V2TuiContext;
-    augmented.onConfigChanged = () =>
-      notifyConfigChanged(directory, 'preset-manager');
+    augmented.onConfigChanged = (change) => {
+      if (change?.kind === 'apply') {
+        const result = publishTuiPresetSwitch(
+          ctx,
+          directory,
+          change.presetName,
+          target,
+        );
+        if (!result.ok) return result;
+      }
+      return notifyConfigChanged(directory, 'preset-manager');
+    };
     return augmented;
   };
   // Tracks the runtime's effective `multiplexer.type` (onMultiplexerConfig).
@@ -2115,6 +2359,8 @@ async function setup(ctx: V2TuiContext): Promise<undefined | (() => void)> {
   };
   const version = (await readPackageVersion()) ?? 'dev';
   const runtime = createSidebarRuntime({
+    presetOwner: ctx,
+    initialConfig,
     version,
     hostFlavor: 'v2',
     getDirectory: () => ctx.location?.directory ?? process.cwd(),

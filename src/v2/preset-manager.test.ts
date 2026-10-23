@@ -61,7 +61,7 @@ interface StubOptions {
    * Test seam forwarded to the manager context. `null` omits the seam
    * entirely (no live refresh available); the default resolves ok.
    */
-  onConfigChanged?: (() => void | Promise<void>) | null;
+  onConfigChanged?: V2PresetManagerContext['onConfigChanged'] | null;
 }
 
 /** Dialog/toast stub over a temp config dir; every call is captured. */
@@ -809,17 +809,29 @@ describe('preset manager config refresh', () => {
 
   test('plain Save triggers the config refresh once', async () => {
     let changed = 0;
+    let metadata: unknown;
     await run(P_CONFIG, {
       models: [GPT5_MODEL],
       selects: saveTrail(),
       prompts: ['', '{}'],
-      onConfigChanged: () => {
+      onConfigChanged: (change) => {
+        metadata = change;
         changed += 1;
       },
     });
-    await flush();
-
     expect(changed).toBe(1);
+    expect(metadata).toEqual({ kind: 'save', presetName: 'p' });
+  });
+
+  test('Save & Apply reports apply metadata exactly once', async () => {
+    const changes: unknown[] = [];
+    await run(BALANCED, {
+      selects: BALANCED_SAVE_APPLY_TRAIL,
+      onConfigChanged: (change) => {
+        changes.push(change);
+      },
+    });
+    expect(changes).toEqual([{ kind: 'apply', presetName: 'balanced' }]);
   });
 
   // --- a failed/missing refresh is reported honestly, exactly once ----------

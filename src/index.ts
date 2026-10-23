@@ -39,6 +39,11 @@ import {
 } from './config/constants';
 import type { ConfigLoadWarningKind } from './config/loader';
 import { RuntimeConfig } from './config/runtime';
+import {
+  type PluginConfig,
+  PluginConfigSchema,
+  type ResolvedPluginConfig,
+} from './config/schema';
 import { getBuildInfo } from './generated/build-info';
 import { HEALTH_CHECK, minimumExpectedToolCount } from './health-check';
 import {
@@ -337,16 +342,16 @@ function selectDelegatedModel(input: {
 // of the config file's preset. State lives in RuntimeConfig.
 
 /**
- * Result of the v2-only `v2.refreshProfiles` hook. `ok: true` carries the
- * freshly resolved inference profiles plus the sidebar projection that was
- * already written; `ok: false` carries the failure reason and guarantees no
- * state was swapped.
+ * Result of the v2-only profile hooks. `ok: true` carries fresh inference
+ * profiles and a sidebar projection. Only `v2.refreshProfiles` publishes the
+ * projection and chains; `v2.resolveProfiles` leaves shared state untouched.
  */
 export type V2ProfileRefreshResult =
   | {
       ok: true;
       profiles: AgentRuntimeProfiles;
-      projection: AgentModelProjection;
+      projection: AgentModelProjection & { preset?: string };
+      chains?: Record<string, ModelChainEntry[]>;
     }
   | { ok: false; reason: string };
 
@@ -611,6 +616,11 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   let chatHeadersHook: ReturnType<typeof createChatHeadersHook> | undefined;
   let foregroundFallback: ForegroundFallbackManager;
   let foregroundFallbackChains: Record<string, ModelChainEntry[]> = {};
+  let registeredFallbackChains: Record<string, ModelChainEntry[]> | undefined;
+  const sessionDispatchChains = new Map<
+    string,
+    Record<string, ModelChainEntry[]>
+  >();
   let selectedMarketplacePackageIds: readonly string[] = [];
   let deepworkCommandHook: ReturnType<typeof createDeepworkCommandHook>;
   let deepworkGuardHook: ReturnType<typeof createDeepworkGuardHook>;
@@ -724,6 +734,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         foregroundFallback.disableChain(name);
       }
     }
+    registeredFallbackChains ??= { ...foregroundFallbackChains };
   }
 
   const resolvePrimaryModelFromFinalHostConfig = (
@@ -766,7 +777,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // generation at launch (the same generation as its frozen profile),
       // while the parent's downProviders are provider names and carry over
       // across generations unchanged.
-      childChain: foregroundFallbackChains[agentName],
+      childChain: ((config.sessionModelState === true
+        ? sessionDispatchChains.get(parentSessionID)
+        : undefined) ?? foregroundFallbackChains)[agentName],
       followsParent,
       // External-selection metadata deliberately ignores internal fallback
       // replays (#1079). Delegation needs the opposite view: the model
@@ -1080,6 +1093,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     sessionLifecycle = new SessionLifecycle(log);
     sessionLifecycle.onSessionDeleted((sessionID) => {
       compactingSessionIds.delete(sessionID);
+      sessionDispatchChains.delete(sessionID);
     });
 
     // Initialize auto-update checker hook
@@ -1946,22 +1960,17 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
    * Re-read the plugin config from disk and resolve ONLY the
    * inference/runtime profile fields (model, variant, temperature, provider
    * options) for each agent, plus the sidebar model projection. The v2
-   * adapter consumes this through the `v2.refreshProfiles` hook when a
-   * watched config file changes or a preset is applied.
+   * adapter consumes this through `v2.resolveProfiles` at root prompts and
+   * `v2.refreshProfiles` when a watched config file changes.
    *
    * This is deliberately NOT a global agent reload: the session-frozen
    * surfaces (agent definitions, prompts, tools, permissions, skills, MCPs)
    * are never rebuilt and the host agent registry is never reloaded. The
    * running generation state (`config`, `runtime`, `agentDefs`, `agents`,
    * `finalHostAgentConfig`) is untouched — a throwaway `RuntimeConfig.create`
-   * view resolves the fresh file against the captured host layer. On success
-   * the refresh republishes the complete next chain generation (config +
-   * marketplace-merged, see buildChainGeneration) beside the sidebar write,
-   * so chain consumers never serve a different generation than the profiles.
-   * New child sessions receive the refreshed inference fields through the v2
-   * session-profile bridge (and pin the chain generation at registration);
-   * the sidebar is rewritten through the existing `recordTuiAgentModels`
-   * writer.
+   * view resolves the fresh file against the captured host layer. Resolution
+   * alone never writes the sidebar or publishes chains. The global refresh
+   * wrapper performs those side effects from the same resolved state.
    *
    * Returns a discriminated result; a failure never claims success and never
    * swaps state (the caller decides what to do with the reason). A config
@@ -1969,32 +1978,50 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
    * is a hard failure: the loader would otherwise fall back to `{}` and the
    * "refresh" would report ok while wiping every profile/agent model.
    */
-  const refreshProfilesFromDisk = async (options?: {
+  const resolveRuntimeFromDisk = async (options?: {
+    config?: PluginConfig | ResolvedPluginConfig;
     /** Startup has no last-good table yet; use the loader's normal fallback
      * config so malformed user input remains non-fatal for this generation. */
     allowInvalidFallback?: boolean;
-  }): Promise<V2ProfileRefreshResult> => {
+  }) => {
     try {
       // Malformed config handling: collect warnings and abort BEFORE any
       // resolution or sidebar rewrite when the load is invalid. The loader
       // falls back to `{}` for invalid JSON/schema, which would otherwise
       // report a successful "refresh" that wipes every profile/model.
       const hardWarnings: string[] = [];
-      const freshConfig = loadPluginConfig(ctx.directory, {
-        hostFlavor,
-        silent: true,
-        onWarning: (warning) => {
-          if (HARD_PROFILE_REFRESH_WARNING_KINDS.has(warning.kind)) {
-            hardWarnings.push(
-              `${warning.kind} (${warning.path}): ${warning.message}`,
-            );
-          }
-        },
-      });
+      if (options?.config) {
+        // Validate flattened preset rows without re-merging the effective
+        // snapshot or replacing it with defaulted/stripped parser output.
+        PluginConfigSchema.parse({
+          ...options.config,
+          presets: options.config.presets
+            ? Object.fromEntries(
+                Object.entries(options.config.presets).map(([name, agents]) => [
+                  name,
+                  { agents },
+                ]),
+              )
+            : undefined,
+        });
+      }
+      const freshConfig = options?.config
+        ? (structuredClone(options.config) as ResolvedPluginConfig)
+        : loadPluginConfig(ctx.directory, {
+            hostFlavor,
+            silent: true,
+            onWarning: (warning) => {
+              if (HARD_PROFILE_REFRESH_WARNING_KINDS.has(warning.kind)) {
+                hardWarnings.push(
+                  `${warning.kind} (${warning.path}): ${warning.message}`,
+                );
+              }
+            },
+          });
       if (hardWarnings.length > 0 && !options?.allowInvalidFallback) {
         const reason = `config load failed: ${hardWarnings.join('; ')}`;
         log('[plugin] runtime profile refresh from disk failed', reason);
-        return { ok: false, reason };
+        return { ok: false as const, reason };
       }
       const freshRuntime = RuntimeConfig.create(ctx.directory, freshConfig);
       const hostSnapshot = runtime.host();
@@ -2003,7 +2030,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       }
       // Mirror factory init: a persisted runtime preset (in-session switch)
       // survives the reload and wins over the config-file preset.
-      const runtimePresetName = runtime.getRuntimePreset();
+      const runtimePresetName = options?.config
+        ? undefined
+        : runtime.getRuntimePreset();
       let runtimePreset: Preset | undefined;
       if (runtimePresetName && freshConfig.presets?.[runtimePresetName]) {
         freshRuntime.setRuntimePreset(runtimePresetName);
@@ -2027,6 +2056,60 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         agentConfigs: mergedAgents,
         runtimePreset,
       });
+      const chains = buildChainGeneration(
+        freshRuntime,
+        freshAgentDefs,
+        resolvedAgentRegistry
+          ? {
+              ...resolvedAgentRegistry.modelCandidates,
+              ...resolvedAgentRegistry.marketplaceManifestChains,
+            }
+          : undefined,
+      );
+      for (const name of Object.keys(chains)) {
+        if (
+          freshRuntime.combinedModelInheritanceSource(name) === undefined &&
+          runtime.hasModelSwitched(name)
+        ) {
+          chains[name] = [];
+        }
+      }
+      return {
+        ok: true as const,
+        profiles,
+        projection: {
+          ...projection,
+          ...(freshConfig.preset !== undefined
+            ? { preset: freshConfig.preset }
+            : {}),
+        },
+        chains,
+        freshRuntime,
+        freshAgentDefs,
+      };
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      log('[plugin] runtime profile resolution from disk failed', reason);
+      return { ok: false as const, reason };
+    }
+  };
+
+  const resolveProfilesFromDisk = async (options?: {
+    config?: PluginConfig | ResolvedPluginConfig;
+  }): Promise<V2ProfileRefreshResult> => {
+    const resolved = await resolveRuntimeFromDisk(options);
+    if (!resolved.ok) return resolved;
+    const { profiles, projection, chains } = resolved;
+    return { ok: true, profiles, projection, chains };
+  };
+
+  const refreshProfilesFromDisk = async (options?: {
+    allowInvalidFallback?: boolean;
+  }): Promise<V2ProfileRefreshResult> => {
+    const resolved = await resolveRuntimeFromDisk(options);
+    if (!resolved.ok) return resolved;
+    const { profiles, projection, freshRuntime } = resolved;
+    try {
       // Sidebar projection must land before the profiles are reported as
       // refreshed (the caller swaps only on an ok result).
       //
@@ -2061,18 +2144,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // Manifest chains overlay the startup candidates: a user override
       // removed since startup must fall back to the package's own chain,
       // not the stale merged candidates.
-      const freshCandidates = resolvedAgentRegistry
-        ? {
-            ...resolvedAgentRegistry.modelCandidates,
-            ...resolvedAgentRegistry.marketplaceManifestChains,
-          }
-        : undefined;
-      publishChainGeneration(
-        buildChainGeneration(freshRuntime, freshAgentDefs, freshCandidates),
-        freshRuntime,
-        (name) => runtime.hasModelSwitched(name),
+      publishChainGeneration(resolved.chains, freshRuntime, (name) =>
+        runtime.hasModelSwitched(name),
       );
-      return { ok: true, profiles, projection };
+      return { ok: true, profiles, projection, chains: resolved.chains };
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       log('[plugin] runtime profile refresh from disk failed', reason);
@@ -2118,6 +2193,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     // inference/runtime profiles for new child sessions + the sidebar.
     // Unknown to v1 hosts, consumed by src/v2/setup.ts.
     'v2.refreshProfiles': refreshProfilesFromDisk,
+    'v2.resolveProfiles': resolveProfilesFromDisk,
     'v2.foreignTaskEvent': observeForeignTaskEvent,
     'v2.resolveDelegatedModel': resolveV2DelegatedModel,
     // Per-instance background-default flip handle: v2 setup arms it after
@@ -2127,12 +2203,33 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       foregroundFallback.handleV2Retry.bind(foregroundFallback),
     // v2-only extension hook: pin the chain generation in effect when a
     // child session registers — the same generation as its frozen profile.
-    'v2.pinSessionChains': (sessionID: string) => {
-      foregroundFallback.pinSessionChains(sessionID);
+    'v2.setSessionDispatchChains': (
+      sessionID: string,
+      chains: Record<string, ModelChainEntry[]>,
+    ) => {
+      if (config.sessionModelState !== true) return;
+      // A root's own execution remains on its registered generation, not the
+      // dispatch snapshot selected for future children. Never disturb a descent
+      // already pinned by an earlier registration or fallback observation.
+      foregroundFallback.pinSessionChains(
+        sessionID,
+        registeredFallbackChains ?? {},
+        false,
+      );
+      sessionDispatchChains.set(sessionID, chains);
+    },
+    'v2.pinSessionChains': (
+      sessionID: string,
+      chains?: Record<string, ModelChainEntry[]>,
+    ) => {
+      if (config.sessionModelState === true && chains)
+        sessionDispatchChains.set(sessionID, chains);
+      foregroundFallback.pinSessionChains(sessionID, chains);
     },
     // v2-only extension hook: release the pin when the admission that
     // captured it fails, so the retry pins the generation current then.
     'v2.releaseSessionChains': (sessionID: string) => {
+      sessionDispatchChains.delete(sessionID);
       foregroundFallback.releaseSessionChains(sessionID);
     },
     // v2 owns its own interview bridge/service; point the submit tool and
@@ -3324,9 +3421,17 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   } as Hooks & {
     'v2.foreignTaskEvent': typeof observeForeignTaskEvent;
     'v2.refreshProfiles': typeof refreshProfilesFromDisk;
+    'v2.resolveProfiles': typeof resolveProfilesFromDisk;
     'v2.resolveDelegatedModel': typeof resolveV2DelegatedModel;
     'v2.backgroundDefaultFlip': BackgroundDefaultFlipState;
-    'v2.pinSessionChains': (sessionID: string) => void;
+    'v2.setSessionDispatchChains': (
+      sessionID: string,
+      chains: Record<string, ModelChainEntry[]>,
+    ) => void;
+    'v2.pinSessionChains': (
+      sessionID: string,
+      chains?: Record<string, ModelChainEntry[]>,
+    ) => void;
     'v2.releaseSessionChains': (sessionID: string) => void;
   };
 

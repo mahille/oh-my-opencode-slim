@@ -45,6 +45,10 @@ Maintain repository-level build, packaging, and release validation automation. G
   - Uses OPENCODE_SMOKE_VERSION when set so scheduled CI can test the pinned supported host and latest-host canary;
     defaults to latest for local and release smoke runs.
   - Captures logs and fails on failed to load plugin and cannot find module patterns.
+- `verify-preset-session-isolation.ts`
+  - Starts a private v2 server and two real tmux TUI clients with isolated HOME/XDG/config and an offline loopback provider.
+  - Asserts actual outbound child model IDs after a preset switch: isolation with `sessionModelState` enabled, global refresh with the flag false or omitted, and unchanged captured children in both modes.
+  - Supports attach-only mode; waits for global refresh before checking isolation and retains diagnostic artifacts under `/tmp/opencode` without touching the shared service.
 - `benchmark-opencode-cache.ts`
   - Executes baseline provider runs and benchmarks cache-hit rates across multiple scenarios.
   - Reports per-provider cache effectiveness: ratios of cache reads to total requests, identifies plateaus

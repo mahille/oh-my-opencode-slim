@@ -7,10 +7,14 @@
  * flow — v2 hosts get the sidebar plus the same three-level preset manager
  * the v1 TUI has (see `./preset-manager`), reached from `/preset` or the
  * sidebar's preset row; `/preset <name>` stays the direct fast path
- * (on-disk persist → refresh REQUESTED: sidebar re-read + file-write-driven
- * server watcher). The server watcher's outcome is not observable from the
- * TUI process, so success toasts say "Live refresh requested" and failures
- * show the reload fallback.
+ * (persist → when sessionModelState is enabled, synchronously publish an
+ * immutable-config switch marker for the conversation captured at
+ * command/dialog opening → request global refresh in either mode).
+ * Without a target, Apply updates only this TUI's default for future roots;
+ * manager Save never switches a conversation. The server consumes markers
+ * via its watcher and prompt admission, but the TUI cannot observe application,
+ * so success toasts say "Live refresh requested" and failures show the reload
+ * fallback.
  *
  * Hosts discover this entry through the package.json `./tui` export
  * (exports-map probe in the host's `kind: "tui"` loader pass); the
@@ -24,14 +28,18 @@ import {
   switchPresetOnDisk,
 } from '../tools/preset-switch';
 import type { TuiRouteView } from '../tui';
-import omoTui, { resolveRouteSessionId } from '../tui';
+import omoTui, {
+  publishTuiPresetSwitch,
+  resolveRouteSessionId,
+  tuiSessionModelStateEnabled,
+} from '../tui';
 import {
   KILL_ALL_COMMAND_ID,
   KILL_ALL_KEYBIND,
   killAllRunningSubagents,
   killAllSummaryMessage,
 } from '../tui-kill';
-import { readTuiSnapshot } from '../tui-state';
+import { readTuiSnapshot, resolveTuiSnapshotRoot } from '../tui-state';
 import { isPluginDisabledByEnv } from '../utils/env';
 import { log } from '../utils/logger';
 import { notifyConfigChanged } from './config-change-coordinator';
@@ -105,8 +113,8 @@ const PRESET_APP_SLOT = 'app';
 /**
  * Apply a preset by name through the shared on-disk switcher
  * (`switchPresetOnDisk`): the preset name is persisted to the user config so
- * the next reload/restart picks it up; the running session is untouched.
- * `runPresetFlow` follows a successful switch with the config refresh.
+ * future starts pick it up. This helper only persists; `runPresetFlow` then
+ * publishes the target's immutable-config switch request before yielding.
  * Returns the switch result whose `message` is user-facing (toast-ready).
  */
 export function applyPresetByName(
@@ -121,15 +129,15 @@ export function applyPresetByName(
 
 /**
  * `/preset` flow: bare `/preset` opens the three-level preset manager
- * (applying a preset persists the name on disk, reports the toast, and
- * requests the config refresh for new dispatches/sidebar); `/preset <name>`
+ * (Apply persists and publishes a targeted immutable-config request; Save
+ * only persists edits); `/preset <name>`
  * keeps the direct fast path that works even when the host exposes no
  * dialogs. Never throws — failures are surfaced as a toast and logged.
  *
  * Feedback is honest about the process boundary: the TUI can persist and
- * REQUEST the live refresh (local sidebar re-read + the server-side watcher
- * reacting to the file write), but it cannot observe the server watcher's
- * outcome, so a successful switch never claims the refresh was applied and a
+ * publish the captured target/config and REQUEST the live refresh, but cannot
+ * observe server application through the marker watcher or prompt admission,
+ * so a successful switch never claims the refresh was applied and a
  * failed/missing request path shows the actionable reload fallback.
  */
 export async function runPresetFlow(
@@ -137,6 +145,13 @@ export async function runPresetFlow(
   presetArg?: string,
 ): Promise<void> {
   const directory = ctx.location?.directory ?? process.cwd();
+  tuiSessionModelStateEnabled(ctx, directory);
+  // Capture at command/dialog OPEN, not after asynchronous dialog navigation.
+  const visible = resolveRouteSessionId(ctx.ui?.router?.current?.());
+  const target =
+    visible === undefined
+      ? undefined
+      : resolveTuiSnapshotRoot(readTuiSnapshot(directory), visible);
   const toast = (message: string) => {
     const toastApi = ctx.ui?.toast;
     if (toastApi && typeof toastApi.show === 'function') {
@@ -157,9 +172,17 @@ export async function runPresetFlow(
         return;
       }
       // Persistence succeeded; request the live refresh and report honestly.
-      // Success text says "Live refresh requested" (the server watcher owns
+      // Success text says "Live refresh requested" (the server owns
       // the outcome); a failed request falls back to the reload action.
-      const outcome = await notifyConfigChanged(directory, '/preset');
+      const published = publishTuiPresetSwitch(
+        ctx,
+        directory,
+        requested,
+        target,
+      );
+      const outcome = published.ok
+        ? await notifyConfigChanged(directory, '/preset')
+        : published;
       if (outcome.ok) {
         toast(liveRefreshSuccessMessage(requested, result.summary));
       } else {
@@ -177,11 +200,21 @@ export async function runPresetFlow(
       return;
     }
 
-    // Bare `/preset`: open the three-level manager with the shared
-    // config-change coordinator so Apply/Save refresh the sidebar state.
+    // Bare `/preset`: Apply publishes to the captured target; Save only
+    // notifies config listeners and leaves bound conversations unchanged.
     const managerCtx = Object.create(ctx as object) as V2PresetTuiContext;
-    managerCtx.onConfigChanged = () =>
-      notifyConfigChanged(directory, '/preset-manager');
+    managerCtx.onConfigChanged = (change) => {
+      if (change?.kind === 'apply') {
+        const result = publishTuiPresetSwitch(
+          ctx,
+          directory,
+          change.presetName,
+          target,
+        );
+        if (!result.ok) return result;
+      }
+      return notifyConfigChanged(directory, '/preset-manager');
+    };
     await openPresetManagerV2(managerCtx, directory);
   } catch (err) {
     log('[v2][tui] preset flow failed', String(err));
